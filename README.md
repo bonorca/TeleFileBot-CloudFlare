@@ -1,8 +1,6 @@
 # TeleFileBot
 
 > A personal file storage bot for Telegram, powered by Cloudflare Workers + D1. Zero cost. Zero servers. Unlimited uptime.
-
-[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/yourname/telefilebot-cloudflare)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 ---
