@@ -1,16 +1,27 @@
 {
-	"name": "telebot",
-	"version": "0.0.0",
-	"private": true,
+	"name": "telefilebot-cloudflare",
+	"version": "1.0.0",
+	"description": "A personal file storage bot for Telegram, powered by Cloudflare Workers + D1",
+	"main": "src/index.js",
 	"scripts": {
-		"deploy": "wrangler deploy",
 		"dev": "wrangler dev",
-		"start": "wrangler dev",
-		"test": "vitest"
+		"deploy": "wrangler deploy",
+		"db:init": "wrangler d1 execute telefilebot-cloudflare-db --file=schema.sql --remote",
+		"webhook:register": "echo 'Visit https://YOUR_WORKER.workers.dev/registerWebhook'",
+		"webhook:unregister": "echo 'Visit https://YOUR_WORKER.workers.dev/unregisterWebhook'",
+		"logs": "wrangler tail"
 	},
+	"keywords": [
+		"telegram",
+		"bot",
+		"file-storage",
+		"cloudflare-workers",
+		"d1",
+		"backup",
+		"serverless"
+	],
+	"license": "MIT",
 	"devDependencies": {
-		"@cloudflare/vitest-pool-workers": "^0.12.4",
-		"vitest": "~3.2.0",
-		"wrangler": "^4.67.0"
+		"wrangler": "^4.0.0"
 	}
 }
