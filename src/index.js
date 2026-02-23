@@ -1,7 +1,4 @@
-// =============================================================================
-// TeleFileBot — Cloudflare Workers + D1
-// https://github.com/yourname/telegram-file-vault
-// =============================================================================
+// TeleFileBot — Cloudflare
 
 const PAGE_SIZE = 10;
 const MAX_FUZZY_RESULTS = 10;
