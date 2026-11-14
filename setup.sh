@@ -137,7 +137,9 @@ echo "  3. Admin ID      — your Telegram user ID (get from @userinfobot)"
 echo ""
 
 # BOT_TOKEN
-read -rp "$(echo -e "${CYAN}Enter your Bot Token:${NC} ")" BOT_TOKEN
+# -s: don't echo the token to the screen (or into terminal recordings)
+read -rsp "$(echo -e "${CYAN}Enter your Bot Token (hidden):${NC} ")" BOT_TOKEN
+echo ""
 if [ -z "$BOT_TOKEN" ]; then
   error "Bot Token cannot be empty."
 fi
@@ -160,9 +162,12 @@ if [ -z "$ADMIN_ID" ]; then
 fi
 
 # Generate random BOT_SECRET
+# Only cryptographic randomness; never fall back to something guessable
 BOT_SECRET=$(openssl rand -hex 32 2>/dev/null || \
-             head -c 64 /dev/urandom | od -An -tx1 | tr -d ' \n' | head -c 64 || \
-             date +%s%N | sha256sum | head -c 64)
+             head -c 32 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' \n')
+if [[ ! "$BOT_SECRET" =~ ^[0-9a-f]{64}$ ]]; then
+  error "Could not generate a random secret (need openssl or /dev/urandom)."
+fi
 
 info "Generated random webhook secret."
 
@@ -185,11 +190,12 @@ echo "$DEPLOY_OUTPUT"
 WORKER_URL=$(echo "$DEPLOY_OUTPUT" | grep -oP 'https://[^\s]+\.workers\.dev' | head -1 || true)
 
 if [ -z "$WORKER_URL" ]; then
-  WORKER_URL=$(echo "$DEPLOY_OUTPUT" | grep -oP 'https://[^\s]+' | head -1 || true)
-fi
-
-if [ -z "$WORKER_URL" ]; then
-  error "Could not determine worker URL. Deploy may have failed."
+  # The secret is sent to this URL next, so never guess it from other links in the output
+  read -rp "$(echo -e "${CYAN}Could not detect the workers.dev URL. Enter it (https://….workers.dev):${NC} ")" WORKER_URL
+  if [[ ! "$WORKER_URL" =~ ^https://[A-Za-z0-9.-]+\.workers\.dev/?$ ]]; then
+    error "That is not a workers.dev URL. Register the webhook manually (see README)."
+  fi
+  WORKER_URL="${WORKER_URL%/}"
 fi
 
 success "Deployed to: $WORKER_URL"
@@ -199,7 +205,8 @@ success "Deployed to: $WORKER_URL"
 # =============================================================================
 step "Step 7/7: Registering Telegram webhook..."
 
-WEBHOOK_RESULT=$(curl -s "${WORKER_URL}/registerWebhook?secret=${BOT_SECRET}")
+# The secret goes in a header read from stdin, so it isn't in the URL (logs) or in curl's argv (ps)
+WEBHOOK_RESULT=$(printf 'Authorization: Bearer %s\n' "$BOT_SECRET" | curl -s -H @- "${WORKER_URL}/registerWebhook")
 echo "$WEBHOOK_RESULT"
 
 if echo "$WEBHOOK_RESULT" | grep -q '"ok":true'; then

@@ -139,13 +139,15 @@ wrangler deploy
 
 #### 第 6 步：注册 webhook
 
-在浏览器打开下面的地址，带上你的 `BOT_SECRET`：
+把 `BOT_SECRET` 放在请求头里调用（密钥不会出现在 URL、日志和浏览器历史里）：
 
-```
-https://your-worker.workers.dev/registerWebhook?secret=YOUR_BOT_SECRET
+```bash
+curl -H "Authorization: Bearer YOUR_BOT_SECRET" https://your-worker.workers.dev/registerWebhook
 ```
 
-不带密钥会返回 403，别人就无法改掉或删除你的 webhook。`/unregisterWebhook?secret=…` 也一样。
+在浏览器里打开 `https://your-worker.workers.dev/registerWebhook?secret=YOUR_BOT_SECRET` 也可以。不带密钥会返回 403，别人就无法改掉或删除你的 webhook。`/unregisterWebhook` 也一样。
+
+> 提示：在 [@BotFather](https://t.me/BotFather) 里执行 `/setjoingroups` → **Disable**，别人就没法把你的 bot 拉进群。
 
 </details>
 
@@ -228,6 +230,16 @@ bot 支持英文和中文，消息、按钮、分类名、`/` 命令菜单，以
 
 - 默认语言用 `wrangler.jsonc` 里的 `BOT_LANG` 变量设置（`"en"` 或 `"zh"`），也可以随时用 `/lang` 切换。切换结果存在 `settings` 表里，优先于 `BOT_LANG`。
 - 数据库里每个分类存的是固定的键，所以中英文名对应的是同一个分类。切换语言不会改动已存的数据，已有的文件名也保持不变，只有之后新命名的文件才用新语言。
+
+### 安全
+
+- **只有你能用。** 非 `ADMIN_ID` 的用户发来的任何更新，在做任何事之前就会被丢弃：不回复、不读数据库、不调用 AI。检查的是发送者本人，不只是聊天 ID。
+- **Webhook 认证。** `/registerWebhook` 会注册 `…/webhook`，并使用 Telegram 的 `secret_token`。密钥放在请求头里，不会出现在 URL 或请求日志中。一旦收到过带这个请求头的请求，之后不带它的请求都会被拒绝，旧的 `/webhook/<密钥>` 路径也一样。如果你是在这个功能之前注册的，打开一次 `/registerWebhook?secret=…` 即可切换。
+- **管理地址**（`/registerWebhook`、`/unregisterWebhook`）必须带密钥：`Authorization: Bearer <BOT_SECRET>` 请求头或 `?secret=`，否则返回 403。建议用请求头，查询参数会留在日志里。
+- **缺少密钥时**，worker 会直接拒绝 webhook 请求（503），而不是在配置不全的状态下运行。
+- **来路不明的文件名、说明文字和转发来源频道名**会去掉控制字符和格式字符（双向控制符、零宽字符、不可见的标签字符等），`invoice\u202Efdp.exe` 这种名字没法伪装成 PDF。
+- **提示词注入**：文件里的文字会被标成「数据」再交给 AI。精心构造的文件最多只能决定自己的名字（经过清理，最多 40 个字符）和分类，或者影响 AI 搜索的推荐结果（推荐结果仍需你手动点选）。它没法执行命令，也没法删除任何东西。
+- **会发给 Workers AI 的内容**：文件名、说明文字、分类和标签，以及照片和图片文件的一张小预览图。按规则分类的文件（贴纸、语音、电子书、安装包）不会发送任何内容。
 
 ### 费用
 

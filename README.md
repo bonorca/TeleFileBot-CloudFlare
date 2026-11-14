@@ -139,13 +139,15 @@ wrangler deploy
 
 #### Step 6: Register the webhook
 
-Open this URL in your browser, with your `BOT_SECRET`:
+Call it with your `BOT_SECRET` in a header (keeps the secret out of URLs, logs and browser history):
 
-```
-https://your-worker.workers.dev/registerWebhook?secret=YOUR_BOT_SECRET
+```bash
+curl -H "Authorization: Bearer YOUR_BOT_SECRET" https://your-worker.workers.dev/registerWebhook
 ```
 
-Without the secret the URL answers 403, so nobody else can re-point or remove your webhook. `/unregisterWebhook?secret=…` works the same way.
+Opening `https://your-worker.workers.dev/registerWebhook?secret=YOUR_BOT_SECRET` in a browser also works. Without the secret the URL answers 403, so nobody else can re-point or remove your webhook. `/unregisterWebhook` works the same way.
+
+> Tip: in [@BotFather](https://t.me/BotFather), `/setjoingroups` → **Disable** stops anyone adding your bot to groups.
 
 </details>
 
@@ -228,6 +230,16 @@ The bot speaks English or Chinese: messages, buttons, category names, the `/` co
 
 - Set the default with the `BOT_LANG` variable in `wrangler.jsonc` (`"en"` or `"zh"`), or switch any time with `/lang`. The choice is saved in the `settings` table and overrides `BOT_LANG`.
 - The database stores a fixed key for each category, so the English and Chinese names map to the same category. Switching languages never changes stored data, and existing file names stay as they are — only files named from then on use the new language.
+
+### Security
+
+- **Only you.** Updates from anyone other than `ADMIN_ID` are dropped before any work is done: no reply, no database access, no AI call. The sender is checked, not just the chat.
+- **Webhook authentication.** `/registerWebhook` registers `…/webhook` with Telegram's `secret_token`, so the secret is sent in a header and never appears in URLs or request logs. Once the header has been seen, requests without it are refused, even on the old `/webhook/<secret>` path. If you registered before this existed, open `/registerWebhook?secret=…` once to switch over.
+- **Admin URLs** (`/registerWebhook`, `/unregisterWebhook`) need the secret, as `Authorization: Bearer <BOT_SECRET>` or `?secret=`; without it they answer 403. Prefer the header: query strings end up in logs.
+- **Missing secrets** make the worker refuse webhook traffic (503) instead of running half-configured.
+- **Untrusted file names, captions and forwarded-chat titles** have control and format characters removed (bidi overrides, zero-width and invisible tag characters, …), so `invoice\u202Efdp.exe` can't pose as a PDF.
+- **Prompt injection:** text from files reaches the AI fenced off as data. The worst a crafted file can do is pick its own name (sanitized, at most 40 characters) and category, or nudge AI search suggestions, which you still have to tap. It can't run commands or delete anything.
+- **What reaches Workers AI:** file names, captions, categories and tags, plus a small preview image of photos and image files. Nothing is sent for files the rules classify (stickers, voice notes, e-books, installers).
 
 ### Cost
 
