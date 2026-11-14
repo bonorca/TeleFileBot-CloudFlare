@@ -11,6 +11,10 @@
 	"ai": {
 		"binding": "AI",
 	},
+	"vars": {
+		// Default language: "en" or "zh". /lang in the bot overrides it.
+		"BOT_LANG": "en",
+	},
 	"d1_databases": [
 		{
 			"binding": "DB",

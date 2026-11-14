@@ -1,5 +1,6 @@
 // TeleFileBot — Cloudflare
 
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { Buffer } from 'node:buffer';
 
 const PAGE_SIZE = 10;
@@ -26,22 +27,408 @@ const ALBUM_SETTLE_MS = 2500;
 // /get falls back to AI search over at most this many recent files.
 const AI_SEARCH_MAX_FILES = 1500;
 
-// Fixed categories. The key is stored in the database, so rename with care.
+// ---- Categories ----
+//
+// `key` is what the database stores and never changes, whatever the bot's
+// language. `id` is an ASCII alias used in English prompts. Display names
+// come from `en` / `zh`, so 照片 and Photos are the same category.
 const CATEGORIES = [
-	{ key: '学习', emoji: '📚', desc: '课程资料、讲义、论文、笔记、作业、考试、学习录音' },
-	{ key: '工作', emoji: '💼', desc: '合同、报告、方案、简历、会议纪要、项目文档、工作表格' },
-	{ key: '财务', emoji: '💰', desc: '发票、收据、账单、报税、银行流水、工资单、保单' },
-	{ key: '证件', emoji: '🪪', desc: '身份证、护照、签证、驾照、学生证、各类证书、成绩单' },
-	{ key: '书籍', emoji: '📖', desc: '电子书、小说、漫画、杂志' },
-	{ key: '照片', emoji: '📷', desc: '拍摄的照片和普通图片：人物、风景、旅行、美食、插画、壁纸' },
-	{ key: '截图', emoji: '🖼', desc: '手机或电脑屏幕截图、聊天记录、网页截图' },
-	{ key: '影音', emoji: '🎬', desc: '电影、剧集、短视频、音乐、播客、语音' },
-	{ key: '软件', emoji: '💿', desc: '安装包、源代码、脚本、配置文件、程序压缩包' },
-	{ key: '表情包', emoji: '😀', desc: '表情、贴纸、梗图、GIF 动图' },
-	{ key: '其他', emoji: '📦', desc: '以上都不符合' },
+	{ key: '学习', id: 'study', emoji: '📚', en: 'Study', zh: '学习',
+		descEn: 'course material, lecture notes, papers, homework, exams, lecture recordings',
+		descZh: '课程资料、讲义、论文、笔记、作业、考试、学习录音' },
+	{ key: '工作', id: 'work', emoji: '💼', en: 'Work', zh: '工作',
+		descEn: 'contracts, reports, proposals, resumes, meeting notes, project documents, work spreadsheets',
+		descZh: '合同、报告、方案、简历、会议纪要、项目文档、工作表格' },
+	{ key: '财务', id: 'finance', emoji: '💰', en: 'Finance', zh: '财务',
+		descEn: 'invoices, receipts, bills, taxes, bank statements, payslips, insurance',
+		descZh: '发票、收据、账单、报税、银行流水、工资单、保单' },
+	{ key: '证件', id: 'ids', emoji: '🪪', en: 'IDs', zh: '证件',
+		descEn: 'ID cards, passports, visas, driving licences, student cards, certificates, transcripts',
+		descZh: '身份证、护照、签证、驾照、学生证、各类证书、成绩单' },
+	{ key: '书籍', id: 'books', emoji: '📖', en: 'Books', zh: '书籍',
+		descEn: 'e-books, novels, comics, magazines',
+		descZh: '电子书、小说、漫画、杂志' },
+	{ key: '照片', id: 'photos', emoji: '📷', en: 'Photos', zh: '照片',
+		descEn: 'camera photos and ordinary pictures: people, scenery, travel, food, illustrations, wallpapers',
+		descZh: '拍摄的照片和普通图片：人物、风景、旅行、美食、插画、壁纸' },
+	{ key: '截图', id: 'screenshots', emoji: '🖼', en: 'Screenshots', zh: '截图',
+		descEn: 'phone or computer screenshots, chat logs, web pages',
+		descZh: '手机或电脑屏幕截图、聊天记录、网页截图' },
+	{ key: '影音', id: 'media', emoji: '🎬', en: 'Media', zh: '影音',
+		descEn: 'movies, shows, short videos, music, podcasts, voice messages',
+		descZh: '电影、剧集、短视频、音乐、播客、语音' },
+	{ key: '软件', id: 'software', emoji: '💿', en: 'Software', zh: '软件',
+		descEn: 'installers, source code, scripts, config files, program archives',
+		descZh: '安装包、源代码、脚本、配置文件、程序压缩包' },
+	{ key: '表情包', id: 'stickers', emoji: '😀', en: 'Stickers', zh: '表情包',
+		descEn: 'stickers, emoji, memes, GIFs',
+		descZh: '表情、贴纸、梗图、GIF 动图' },
+	{ key: '其他', id: 'other', emoji: '📦', en: 'Other', zh: '其他',
+		descEn: 'anything else',
+		descZh: '以上都不符合' },
 ];
 const CATEGORY_KEYS = CATEGORIES.map((c) => c.key);
+// Filter value for files without a category (used in callbacks; never stored)
 const UNCATEGORIZED = '未分类';
+
+// =============================================================================
+//  Language
+// =============================================================================
+//
+// The language comes from the `lang` row in the settings table (set with
+// /lang), else the BOT_LANG variable, else English. It is resolved once per
+// request and kept in AsyncLocalStorage, so concurrent requests never mix.
+
+const LANGUAGES = { en: 'English', zh: '中文' };
+const DEFAULT_LANG = 'en';
+const langStore = new AsyncLocalStorage();
+
+function currentLang() {
+	return langStore.getStore() ?? DEFAULT_LANG;
+}
+
+function validLang(value) {
+	return Object.hasOwn(LANGUAGES, value) ? value : null;
+}
+
+async function resolveLang(env) {
+	try {
+		const row = await dbFirst(env.DB, "SELECT value FROM settings WHERE key = 'lang'", []);
+		if (validLang(row?.value)) return row.value;
+	} catch {
+		// settings table missing (migration 0003 not applied) — fall through
+	}
+	return validLang(env.BOT_LANG) ?? DEFAULT_LANG;
+}
+
+const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+
+const STRINGS = {
+	en: {
+		unknownSize: 'Unknown',
+		unauthorized: '⛔ Unauthorized',
+		error: '⚠️ Something went wrong',
+		fileNotFound: 'File not found',
+		cancel: '❌ Cancel',
+		cancelled: 'Cancelled.',
+		confirm: '✅ Confirm',
+		btnRename: '✏️ Rename',
+		btnCategory: '🗂 Category',
+		btnGet: '⬇️ Get',
+		btnCategories: '🗂 Categories',
+		btnPreview: '🖼 Preview',
+		btnContinue: '▶️ Continue',
+		btnAllFiles: (n) => `📂 All files · ${n}`,
+		uncategorized: 'Uncategorized',
+		noMatch: (k) => `❌ No files matching <b>${k}</b>`,
+		tapNumber: 'Tap a number',
+		tapToGet: 'Tap a number to get that file.',
+
+		// upload
+		alreadyExists: (name) => `⚠️ This file already exists as <b>${name}</b>`,
+		forwardFailed: '❌ Could not forward the file to the storage channel.\nMake sure the bot is an admin of the channel.',
+		savedAs: (name, auto) => `✅ Saved as <b>${name}</b>${auto ? ' <i>(auto-named)</i>' : ''}`,
+
+		// album
+		albumAllDup: (n) => `⚠️ All ${plural(n, 'file')} in this album were already saved.`,
+		albumSaved: (n) => `📦 Saved ${plural(n, 'file')} from an album`,
+		albumSkipped: (n) => `⚠️ ${n} already saved, skipped`,
+		albumFooter: 'Tap a number to rename, recategorize or get a file.',
+
+		// lists
+		noFilesYet: '📂 No files yet. Send a file to get started.',
+		categoriesTitle: '🗂 Categories',
+		categoriesSubtitle: (files, cats) => `${plural(files, 'file')} in ${cats} ${cats === 1 ? 'category' : 'categories'}`,
+		uncategorizedHint: (n) => `❔ ${n} uncategorized — send /classify to sort them`,
+		allFilesTitle: '📂 All files',
+		listSubtitle: (n, page, pages) => `${plural(n, 'file')}${pages > 1 ? ` · page ${page} of ${pages}` : ''}`,
+		noFilesInCategory: (c) => `📂 No files in <b>${c}</b>`,
+		noFilesWithTag: (t) => `📂 No files tagged <b>${t}</b>`,
+		sendingPreviews: 'Sending previews…',
+
+		// get
+		getUsage: 'Usage: <code>/get &lt;name&gt;</code>\nPartial names work. If nothing matches, AI searches by meaning.',
+		getNothing: (k) => `❌ No files matching <b>${k}</b>, and AI search found nothing either.`,
+		retrieveFailed: '❌ Could not retrieve the file. It may have been deleted from the channel.',
+		aiSuggestions: '🤖 AI suggestions',
+		aiNoNameMatch: (k) => `No file name contains “${k}”`,
+		filesMatch: (n, k) => `🔍 ${n} files match “${k}”`,
+
+		// delete
+		deleteUsage: 'Usage: <code>/delete &lt;name&gt;</code>',
+		pickDelete: '🗑 Which file do you want to delete?',
+		deleteConfirm: (name) => `Delete <b>${name}</b>?`,
+		deleted: (name) => `🗑 Deleted <b>${name}</b>`,
+		deletedToast: 'Deleted',
+		alreadyDeleted: 'Already deleted',
+
+		// tag
+		tagUsage: 'Usage: <code>/tag &lt;name&gt; &lt;tag&gt;...</code>',
+		pickTag: '🏷 Which file do you want to tag?',
+		tagsUpdated: (name, tags) => `🏷 Tags updated\n📄 <b>${name}</b>\nTags: ${tags}`,
+		tagsUpdatedToast: 'Tags updated',
+
+		// rename
+		renameUsage: 'Usage: <code>/rename &lt;name&gt; [&lt;new&gt;]</code>\nWithout &lt;new&gt;, the bot asks for it.',
+		pickRename: '✏️ Which file do you want to rename?',
+		renamePrompt: '✏️ Reply with a new name for',
+		renameKeepExt: 'Leave out the extension to keep it.',
+		fileGone: '❌ That file no longer exists.',
+		nameEmpty: '❌ The new name is empty.',
+		nameUnchanged: (n) => `Name unchanged: <b>${n}</b>`,
+		nameTaken: (n) => `❌ A file named <b>${n}</b> already exists.`,
+		renamed: (a, b) => `✏️ Renamed\n<b>${a}</b> → <b>${b}</b>`,
+
+		// category
+		catUsage: 'Usage: <code>/cat &lt;name&gt;</code>\nShows category buttons for that file.',
+		pickCategory: '🗂 Which file do you want to recategorize?',
+		pickCategoryFor: (name, current) => `🗂 Pick a category for <b>${name}</b>\nCurrent: ${current}`,
+		recategorized: (name, label) => `🗂 <b>${name}</b> → ${label}`,
+
+		// classify
+		classifyAllGood: '✅ Every file has a category and a real name.',
+		processed: (n) => `🗂 Processed ${plural(n, 'file')}`,
+		left: (n) => `${n} left`,
+		allDone: 'All done',
+		tapContinue: 'Tap Continue for the next batch.',
+		classifying: 'Classifying…',
+		was: (old) => `was ${old}`,
+
+		// stats
+		statsTitle: '📊 <b>Storage statistics</b>',
+		statsFiles: (n) => `📁 Files: <b>${n}</b>`,
+		statsSize: (s) => `💾 Total size: <b>${s}</b>`,
+		statsByType: '<b>By type</b>',
+		statsByCategory: '<b>By category</b>',
+		typeImages: 'Images',
+		typeVideos: 'Videos',
+		typeAudio: 'Audio',
+		typeOther: 'Other',
+
+		// language
+		langCurrent: (name) => `🌐 Language: <b>${name}</b>\nPick one, or send <code>/lang en</code> / <code>/lang zh</code>.`,
+		langSet: (name) => `🌐 Language set to <b>${name}</b>. Category names and new auto-names now use it; existing file names stay as they are.`,
+
+		commands: [
+			['list', 'Browse by category'],
+			['all', 'All files'],
+			['get', 'Send a file (partial name or description)'],
+			['cat', "Change a file's category"],
+			['rename', 'Rename a file'],
+			['tag', 'Add tags to a file'],
+			['delete', 'Delete a file'],
+			['classify', 'Categorize and name older files'],
+			['stats', 'Storage statistics'],
+			['lang', 'Language / 语言'],
+			['help', 'How to use this bot'],
+		],
+		help: `📦 <b>TeleFileBot</b>
+Send any file to save it. It is categorized automatically, and files with
+meaningless names (photo_123.jpg, IMG_4521.HEIC) are renamed after their
+content. A caption helps with both; on an album it applies to every file.
+
+<b>BROWSE</b>
+/list [&lt;category&gt;]
+      List categories, or the files in &lt;category&gt;. A tag also works.
+/all
+      List all files, newest first.
+/get &lt;name&gt;
+      Send a file. Partial names work; AI searches when no name matches.
+
+<b>MANAGE</b>
+/cat &lt;name&gt;
+      Change a file's category.
+/rename &lt;name&gt; [&lt;new&gt;]
+      Rename a file. Without &lt;new&gt;, the bot asks for it.
+/tag &lt;name&gt; &lt;tag&gt;...
+      Add one or more tags.
+/delete &lt;name&gt;
+      Delete a file, after confirmation.
+
+<b>MAINTENANCE</b>
+/classify
+      Categorize and name older files, 8 at a time.
+/stats
+      Show storage statistics.
+/lang [en | zh]
+      Switch the bot's language.
+/help
+      Show this help.
+
+<b>NOTATION</b>
+&lt;arg&gt; required · [arg] optional · ... repeatable`,
+	},
+
+	zh: {
+		unknownSize: '未知',
+		unauthorized: '⛔ 无权使用',
+		error: '⚠️ 出错了',
+		fileNotFound: '文件不存在',
+		cancel: '❌ 取消',
+		cancelled: '已取消。',
+		confirm: '✅ 确认',
+		btnRename: '✏️ 改名',
+		btnCategory: '🗂 分类',
+		btnGet: '⬇️ 获取',
+		btnCategories: '🗂 分类列表',
+		btnPreview: '🖼 预览',
+		btnContinue: '▶️ 继续',
+		btnAllFiles: (n) => `📂 全部文件 · ${n}`,
+		uncategorized: '未分类',
+		noMatch: (k) => `❌ 没有匹配 <b>${k}</b> 的文件`,
+		tapNumber: '点编号选择',
+		tapToGet: '点编号获取文件。',
+
+		alreadyExists: (name) => `⚠️ 这个文件已经存过了：<b>${name}</b>`,
+		forwardFailed: '❌ 无法把文件转存到存储频道。\n请确认 bot 是该频道的管理员。',
+		savedAs: (name, auto) => `✅ 已保存为 <b>${name}</b>${auto ? ' <i>（自动命名）</i>' : ''}`,
+
+		albumAllDup: (n) => `⚠️ 这组相册的 ${n} 个文件都已经存过了。`,
+		albumSaved: (n) => `📦 从相册保存了 ${n} 个文件`,
+		albumSkipped: (n) => `⚠️ ${n} 个已存在，已跳过`,
+		albumFooter: '点编号可改名、改分类或获取文件。',
+
+		noFilesYet: '📂 还没有文件，发一个文件开始吧。',
+		categoriesTitle: '🗂 分类',
+		categoriesSubtitle: (files, cats) => `${files} 个文件 · ${cats} 个分类`,
+		uncategorizedHint: (n) => `❔ ${n} 个未分类，发送 /classify 整理`,
+		allFilesTitle: '📂 全部文件',
+		listSubtitle: (n, page, pages) => `${n} 个文件${pages > 1 ? ` · 第 ${page}/${pages} 页` : ''}`,
+		noFilesInCategory: (c) => `📂 <b>${c}</b> 里还没有文件`,
+		noFilesWithTag: (t) => `📂 没有带 <b>${t}</b> 标签的文件`,
+		sendingPreviews: '正在发送预览…',
+
+		getUsage: '用法：<code>/get &lt;名称&gt;</code>\n可以只写一部分；名字匹配不到时由 AI 按意思查找。',
+		getNothing: (k) => `❌ 没有匹配 <b>${k}</b> 的文件，AI 也没找到。`,
+		retrieveFailed: '❌ 无法获取文件，可能已从频道中删除。',
+		aiSuggestions: '🤖 AI 推荐',
+		aiNoNameMatch: (k) => `没有文件名包含“${k}”`,
+		filesMatch: (n, k) => `🔍 ${n} 个文件匹配“${k}”`,
+
+		deleteUsage: '用法：<code>/delete &lt;名称&gt;</code>',
+		pickDelete: '🗑 要删除哪个文件？',
+		deleteConfirm: (name) => `删除 <b>${name}</b>？`,
+		deleted: (name) => `🗑 已删除 <b>${name}</b>`,
+		deletedToast: '已删除',
+		alreadyDeleted: '已经删除了',
+
+		tagUsage: '用法：<code>/tag &lt;名称&gt; &lt;标签&gt;...</code>',
+		pickTag: '🏷 要给哪个文件加标签？',
+		tagsUpdated: (name, tags) => `🏷 标签已更新\n📄 <b>${name}</b>\n标签：${tags}`,
+		tagsUpdatedToast: '标签已更新',
+
+		renameUsage: '用法：<code>/rename &lt;名称&gt; [&lt;新名称&gt;]</code>\n不写新名称时，bot 会问你。',
+		pickRename: '✏️ 要给哪个文件改名？',
+		renamePrompt: '✏️ 回复新名字：',
+		renameKeepExt: '不写扩展名会保留原来的。',
+		fileGone: '❌ 这个文件已经不存在了。',
+		nameEmpty: '❌ 新名字是空的。',
+		nameUnchanged: (n) => `名字没变：<b>${n}</b>`,
+		nameTaken: (n) => `❌ 已经有叫 <b>${n}</b> 的文件了。`,
+		renamed: (a, b) => `✏️ 已改名\n<b>${a}</b> → <b>${b}</b>`,
+
+		catUsage: '用法：<code>/cat &lt;名称&gt;</code>\n显示该文件的分类按钮。',
+		pickCategory: '🗂 要给哪个文件改分类？',
+		pickCategoryFor: (name, current) => `🗂 给 <b>${name}</b> 选个分类\n当前：${current}`,
+		recategorized: (name, label) => `🗂 <b>${name}</b> → ${label}`,
+
+		classifyAllGood: '✅ 所有文件都有分类和正经名字了。',
+		processed: (n) => `🗂 处理了 ${n} 个文件`,
+		left: (n) => `还剩 ${n} 个`,
+		allDone: '全部完成',
+		tapContinue: '点“继续”处理下一批。',
+		classifying: '正在整理…',
+		was: (old) => `原名 ${old}`,
+
+		statsTitle: '📊 <b>存储统计</b>',
+		statsFiles: (n) => `📁 文件数：<b>${n}</b>`,
+		statsSize: (s) => `💾 总大小：<b>${s}</b>`,
+		statsByType: '<b>按类型</b>',
+		statsByCategory: '<b>按分类</b>',
+		typeImages: '图片',
+		typeVideos: '视频',
+		typeAudio: '音频',
+		typeOther: '其他',
+
+		langCurrent: (name) => `🌐 当前语言：<b>${name}</b>\n点按钮切换，或发送 <code>/lang en</code> / <code>/lang zh</code>。`,
+		langSet: (name) => `🌐 语言已切换为 <b>${name}</b>。分类名和新文件的自动命名会用这个语言，已有的文件名不变。`,
+
+		commands: [
+			['list', '按分类浏览'],
+			['all', '全部文件'],
+			['get', '获取文件（部分名字或描述）'],
+			['cat', '修改文件分类'],
+			['rename', '重命名文件'],
+			['tag', '给文件加标签'],
+			['delete', '删除文件'],
+			['classify', '整理旧文件的分类和名字'],
+			['stats', '存储统计'],
+			['lang', 'Language / 语言'],
+			['help', '使用说明'],
+		],
+		help: `📦 <b>TeleFileBot</b>
+发送任何文件即可保存。文件会自动分类；名字没有意义的文件（photo_123.jpg、IMG_4521.HEIC）会按内容自动改名。附上说明文字可以帮助分类和命名；发相册时说明文字对整组生效。
+
+<b>浏览</b>
+/list [&lt;分类&gt;]
+      列出分类，或某个分类里的文件。也可以写标签。
+/all
+      列出全部文件，最新的在前。
+/get &lt;名称&gt;
+      获取文件。可以只写一部分；名字匹配不到时由 AI 查找。
+
+<b>管理</b>
+/cat &lt;名称&gt;
+      修改文件分类。
+/rename &lt;名称&gt; [&lt;新名称&gt;]
+      重命名。不写新名称时，bot 会问你。
+/tag &lt;名称&gt; &lt;标签&gt;...
+      添加一个或多个标签。
+/delete &lt;名称&gt;
+      删除文件，会先确认。
+
+<b>维护</b>
+/classify
+      整理旧文件的分类和名字，每次 8 个。
+/stats
+      查看存储统计。
+/lang [en | zh]
+      切换 bot 的语言。
+/help
+      显示本帮助。
+
+<b>记号</b>
+&lt;参数&gt; 必填 · [参数] 可选 · ... 可重复`,
+	},
+};
+
+/** Translated string for the current request's language. */
+function t(name, ...args) {
+	const value = STRINGS[currentLang()][name] ?? STRINGS.en[name];
+	return typeof value === 'function' ? value(...args) : value;
+}
+
+function botCommands() {
+	return t('commands').map(([command, description]) => ({ command, description }));
+}
+
+/** Display name of a stored category key in the current language. */
+function categoryName(key) {
+	const c = CATEGORIES.find((x) => x.key === key);
+	return c ? c[currentLang()] : t('uncategorized');
+}
+
+/**
+ * Map user input (stored key, English or Chinese name, ASCII id) to a stored
+ * category key, UNCATEGORIZED, or null.
+ */
+function resolveCategoryInput(input) {
+	const s = input.trim().toLowerCase();
+	if (!s) return null;
+	if (s === UNCATEGORIZED || s === 'uncategorized') return UNCATEGORIZED;
+	const c = CATEGORIES.find((x) => [x.key, x.id, x.en.toLowerCase(), x.zh].includes(s));
+	return c ? c.key : null;
+}
 
 const BOOK_EXTS = new Set(['epub', 'mobi', 'azw', 'azw3', 'fb2', 'djvu', 'cbz', 'cbr']);
 const APP_EXTS = new Set(['apk', 'apks', 'xapk', 'ipa', 'exe', 'msi', 'dmg', 'pkg', 'deb', 'rpm', 'appimage']);
@@ -152,7 +539,7 @@ async function dbFirst(db, sql, params = []) {
  * Format bytes into a human-readable string.
  */
 function formatFileSize(bytes) {
-	if (!bytes || bytes <= 0) return 'Unknown';
+	if (!bytes || bytes <= 0) return t('unknownSize');
 	const units = ['B', 'KB', 'MB', 'GB'];
 	let i = 0;
 	let size = bytes;
@@ -347,10 +734,24 @@ function fallbackCategory(mimeType) {
 	return '其他';
 }
 
-const CLASSIFY_PROMPT = `你是个人网盘的文件整理助手。根据文件名、文件类型、用户附带的说明文字和图片内容，完成两件事。
+/** Value the model must return for each category (ASCII ids in English prompts). */
+function promptCategoryValues() {
+	return currentLang() === 'zh' ? CATEGORY_KEYS : CATEGORIES.map((c) => c.id);
+}
+
+/** Stored key for a model answer (stored key, id or name), or null. */
+function toCategoryKey(value) {
+	if (typeof value !== 'string') return null;
+	const key = resolveCategoryInput(value);
+	return key === UNCATEGORIZED ? null : key;
+}
+
+function classifyPrompt() {
+	if (currentLang() === 'zh') {
+		return `你是个人网盘的文件整理助手。根据文件名、文件类型、用户附带的说明文字和图片内容，完成两件事。
 
 一、category：把文件归入下面恰好一个分类：
-${CATEGORIES.map((c) => `- ${c.key}：${c.desc}`).join('\n')}
+${CATEGORIES.map((c) => `- ${c.key}：${c.descZh}`).join('\n')}
 
 分类要点：
 - photo_123.jpg、video_123.mp4、document_123 这类名字是机器生成的，没有含义，此时以图片内容和说明文字为准。
@@ -365,6 +766,26 @@ ${CATEGORIES.map((c) => `- ${c.key}：${c.desc}`).join('\n')}
 - 原文件名已经有意义时，直接用原文件名去掉扩展名。
 
 只输出 JSON，例如 {"category":"财务","name":"鲜果超市小票_2026-11-14"}。`;
+	}
+	return `You organize files in a personal cloud drive. Using the file name, file type, the user's caption and the image (if any), do two things.
+
+1. category: put the file in exactly one of these categories:
+${CATEGORIES.map((c) => `- ${c.id}: ${c.descEn}`).join('\n')}
+
+Rules:
+- Names like photo_123.jpg, video_123.mp4 or document_123 are machine-generated and meaningless; rely on the image and the caption.
+- An image showing a status bar, chat bubbles, a web page or an app interface → screenshots; a photo of an ID document → ids; a photo of a receipt or ticket → finance.
+- Every other image is photos, never other. Names starting with IMG_1234, DSC_ or PXL_, and .heic files, are camera photos.
+- Judge PDFs and Word files by their topic; being a PDF does not make something a book.
+- When unsure, choose other.
+
+2. name: a short file name that is easy to search for later (no extension, 2–8 words, in English).
+- Say what it is, then the key person, organization, topic or date, e.g. "Grocery receipt FreshMart 2026-11-14", "Chat with Wang - Friday meeting", "Passport photo page", "Sunset at the beach".
+- Translate non-English content into English; keep proper nouns as they are. No words like photo or IMG, and no meaningless numbers.
+- If the original name is already meaningful, use it without the extension.
+
+Output only JSON, e.g. {"category":"finance","name":"Grocery receipt FreshMart 2026-11-14"}.`;
+}
 
 /**
  * Download a Telegram file and return it as a data: URL, or null if it is
@@ -396,10 +817,10 @@ function parseClassification(content) {
 		}
 	}
 
-	let category = CATEGORY_KEYS.includes(obj.category) ? obj.category : null;
+	let category = toCategoryKey(obj.category);
 	if (!category) {
 		const m = text.match(/"category"\s*:\s*"([^"]+)"/);
-		if (m && CATEGORY_KEYS.includes(m[1])) category = m[1];
+		if (m) category = toCategoryKey(m[1]);
 	}
 	if (!category) {
 		// Last resort: the reply names exactly one category somewhere
@@ -416,7 +837,7 @@ async function askModel(env, userText, imageUrl) {
 
 	const res = await env.AI.run(AI_MODEL, {
 		messages: [
-			{ role: 'system', content: CLASSIFY_PROMPT },
+			{ role: 'system', content: classifyPrompt() },
 			{ role: 'user', content },
 		],
 		response_format: {
@@ -427,7 +848,7 @@ async function askModel(env, userText, imageUrl) {
 				schema: {
 					type: 'object',
 					properties: {
-						category: { type: 'string', enum: CATEGORY_KEYS },
+						category: { type: 'string', enum: promptCategoryValues() },
 						name: { type: 'string', maxLength: 60 },
 					},
 					required: ['category', 'name'],
@@ -456,10 +877,13 @@ async function classifyFile(env, file) {
 	if (byRule) return { category: byRule, name: null };
 	if (!env.AI) return { category: fallbackCategory(file.mimeType), name: null };
 
-	const lines = [`文件名：${file.fileName}`, `类型：${file.mimeType || '未知'}`, `大小：${formatFileSize(file.fileSize)}`];
-	if (file.caption) lines.push(`说明文字：${file.caption}`);
-	if (file.source) lines.push(`转发自：${file.source}`);
-	if (file.tags) lines.push(`用户标签：${file.tags}`);
+	const zh = currentLang() === 'zh';
+	const lines = zh
+		? [`文件名：${file.fileName}`, `类型：${file.mimeType || '未知'}`, `大小：${formatFileSize(file.fileSize)}`]
+		: [`File name: ${file.fileName}`, `Type: ${file.mimeType || 'unknown'}`, `Size: ${formatFileSize(file.fileSize)}`];
+	if (file.caption) lines.push(zh ? `说明文字：${file.caption}` : `Caption: ${file.caption}`);
+	if (file.source) lines.push(zh ? `转发自：${file.source}` : `Forwarded from: ${file.source}`);
+	if (file.tags) lines.push(zh ? `用户标签：${file.tags}` : `User tags: ${file.tags}`);
 	const userText = lines.join('\n');
 
 	let imageUrl = null;
@@ -495,7 +919,7 @@ async function classifyFile(env, file) {
 const GENERIC_NAME_PATTERNS = [
 	/^(photo|video|document|audio)_\d+(_\d+)?(\.\w+)?$/i, // generated by this bot
 	/^(img|vid|dsc|dscn|dscf|pxl|mvimg|pano|cimg|imag)[_-]?\d[\d_-]*(\.\w+)?$/i, // cameras
-	/^(screenshot|screen shot|截屏|屏幕截图)/i,
+	/^(screenshot|screen shot|截屏|屏幕截图)[\s_-]?[\d(]/i, // "Screenshot_2026…", not "Screenshots_<date>"
 	/^(微信图片|mmexport|wx_camera)_?\d+(\.\w+)?$/i,
 	/^(image|file|scan|untitled|download|未命名|新建文件)[\s_-]*\(?\d*\)?(\.\w+)?$/i,
 	/^[\d\s_-]+(\.\w+)?$/,
@@ -537,13 +961,13 @@ function autoFileName(fileName, mimeType, { category, name }, date) {
 		.replace(/\s+/g, ' ')
 		.slice(0, 40)
 		.trim();
-	if (!base || isGenericName(base + ext)) base = `${category}_${date}`;
+	if (!base || isGenericName(base + ext)) base = `${categoryName(category)}_${date}`;
 	return base + ext;
 }
 
 function categoryLabel(key) {
 	const c = CATEGORIES.find((x) => x.key === key);
-	return c ? `${c.emoji} ${c.key}` : `❔ ${UNCATEGORIZED}`;
+	return c ? `${c.emoji} ${categoryName(key)}` : `❔ ${t('uncategorized')}`;
 }
 
 /**
@@ -554,12 +978,12 @@ function categoryKeyboard(fileId) {
 	for (let i = 0; i < CATEGORIES.length; i += 3) {
 		rows.push(
 			CATEGORIES.slice(i, i + 3).map((c) => ({
-				text: `${c.emoji} ${c.key}`,
+				text: `${c.emoji} ${categoryName(c.key)}`,
 				callback_data: `setcat:${fileId}:${c.key}`,
 			})),
 		);
 	}
-	rows.push([{ text: '❌ Cancel', callback_data: 'cancel' }]);
+	rows.push([{ text: t('cancel'), callback_data: 'cancel' }]);
 	return { inline_keyboard: rows };
 }
 
@@ -568,10 +992,10 @@ function categoryKeyboard(fileId) {
  */
 function fileActionsKeyboard(fileId, { withGet = false } = {}) {
 	const row = [
-		{ text: '✏️ Rename', callback_data: `ren:${fileId}` },
-		{ text: '🗂 Category', callback_data: `catmenu:${fileId}` },
+		{ text: t('btnRename'), callback_data: `ren:${fileId}` },
+		{ text: t('btnCategory'), callback_data: `catmenu:${fileId}` },
 	];
-	if (withGet) row.unshift({ text: '⬇️ Get', callback_data: `get:${fileId}` });
+	if (withGet) row.unshift({ text: t('btnGet'), callback_data: `get:${fileId}` });
 	return { inline_keyboard: [row] };
 }
 
@@ -581,60 +1005,12 @@ function fileActionsKeyboard(fileId, { withGet = false } = {}) {
 
 // ---- /start & /help ----
 
-// Shown in Telegram's "/" command menu. Kept in sync with the /help text.
-const BOT_COMMANDS = [
-	{ command: 'list', description: 'Browse by category' },
-	{ command: 'all', description: 'All files' },
-	{ command: 'get', description: 'Send a file (partial name or description)' },
-	{ command: 'cat', description: "Change a file's category" },
-	{ command: 'rename', description: 'Rename a file' },
-	{ command: 'tag', description: 'Add tags to a file' },
-	{ command: 'delete', description: 'Delete a file' },
-	{ command: 'classify', description: 'Categorize and name older files' },
-	{ command: 'stats', description: 'Storage statistics' },
-	{ command: 'help', description: 'How to use this bot' },
-];
-
 async function handleHelp(env, chatId) {
-	const text = `📦 <b>TeleFileBot</b>
-Send any file to save it. It is categorized automatically, and files with
-meaningless names (photo_123.jpg, IMG_4521.HEIC) are renamed after their
-content. A caption helps with both; on an album it applies to every file.
-
-<b>BROWSE</b>
-/list [&lt;category&gt;]
-      List categories, or the files in &lt;category&gt;. A tag also works.
-/all
-      List all files, newest first.
-/get &lt;name&gt;
-      Send a file. Partial names work; AI searches when no name matches.
-
-<b>MANAGE</b>
-/cat &lt;name&gt;
-      Change a file's category.
-/rename &lt;name&gt; [&lt;new&gt;]
-      Rename a file. Without &lt;new&gt;, the bot asks for it.
-/tag &lt;name&gt; &lt;tag&gt;...
-      Add one or more tags.
-/delete &lt;name&gt;
-      Delete a file, after confirmation.
-
-<b>MAINTENANCE</b>
-/classify
-      Categorize and name older files, 8 at a time.
-/stats
-      Show storage statistics.
-/help
-      Show this help.
-
-<b>NOTATION</b>
-&lt;arg&gt; required · [arg] optional · ... repeatable`;
-
-	await sendMessage(env.BOT_TOKEN, chatId, text);
+	await sendMessage(env.BOT_TOKEN, chatId, t('help'));
 
 	// Keep Telegram's "/" menu in sync; failure here is harmless
 	try {
-		await tg(env.BOT_TOKEN, 'setMyCommands', { commands: BOT_COMMANDS });
+		await tg(env.BOT_TOKEN, 'setMyCommands', { commands: botCommands() });
 	} catch (err) {
 		console.error('setMyCommands failed:', err);
 	}
@@ -662,7 +1038,7 @@ async function handleFileUpload(env, chatId, message, ctx) {
 			await scheduleAlbumSummary(env, chatId, groupId, ctx);
 			return;
 		}
-		await sendMessage(env.BOT_TOKEN, chatId, `⚠️ This file already exists as <b>${escapeHtml(duplicate.file_name)}</b>`);
+		await sendMessage(env.BOT_TOKEN, chatId, t('alreadyExists', escapeHtml(duplicate.file_name)));
 		return;
 	}
 
@@ -671,11 +1047,7 @@ async function handleFileUpload(env, chatId, message, ctx) {
 	try {
 		fwd = await forwardMessage(env.BOT_TOKEN, env.CHANNEL_ID, chatId, message.message_id);
 	} catch (err) {
-		await sendMessage(
-			env.BOT_TOKEN,
-			chatId,
-			'❌ Failed to forward file to storage channel.\nPlease ensure the bot is an admin of the channel.',
-		);
+		await sendMessage(env.BOT_TOKEN, chatId, t('forwardFailed'));
 		console.error('Forward failed:', err);
 		return;
 	}
@@ -716,8 +1088,7 @@ async function handleFileUpload(env, chatId, message, ctx) {
 	await sendMessage(
 		env.BOT_TOKEN,
 		chatId,
-		`✅ Saved as <b>${escapeHtml(fileName)}</b>${renamed ? ' <i>(auto-named)</i>' : ''}\n` +
-			`🗂 ${categoryLabel(category)} · 💾 ${formatFileSize(fileSize)}`,
+		`${t('savedAs', escapeHtml(fileName), renamed)}\n🗂 ${categoryLabel(category)} · 💾 ${formatFileSize(fileSize)}`,
 		{ reply_markup: fileActionsKeyboard(inserted.meta.last_row_id) },
 	);
 }
@@ -797,7 +1168,7 @@ async function sendAlbumSummary(env, chatId, groupId) {
 
 	let text;
 	if (files.length === 0) {
-		text = `⚠️ All ${dups} file${dups !== 1 ? 's' : ''} in this album were already saved.`;
+		text = t('albumAllDup', dups);
 	} else {
 		const counts = {};
 		for (const f of files) counts[f.category] = (counts[f.category] ?? 0) + 1;
@@ -808,12 +1179,12 @@ async function sendAlbumSummary(env, chatId, groupId) {
 
 		let subtitle = escapeHtml(breakdown);
 		if (group?.caption) subtitle += `\n💬 ${escapeHtml(group.caption)}`;
-		if (dups) subtitle += `\n⚠️ ${dups} already saved, skipped`;
+		if (dups) subtitle += `\n${t('albumSkipped', dups)}`;
 		text = formatFileList(
-			`📦 Saved ${files.length} file${files.length !== 1 ? 's' : ''} from an album`,
+			t('albumSaved', files.length),
 			subtitle,
 			files.map((f, i) => formatFileEntry(f, i + 1)),
-			'<i>Tap a number to rename, recategorize or get a file.</i>',
+			`<i>${t('albumFooter')}</i>`,
 		);
 	}
 
@@ -867,7 +1238,8 @@ async function sendFileCard(env, chatId, fileId) {
 async function handleList(env, chatId, args) {
 	const filter = args.trim();
 	if (filter) {
-		await sendFileList(env, chatId, null, filter, 0);
+		// Category names work in either language; anything else is a tag
+		await sendFileList(env, chatId, null, resolveCategoryInput(filter) ?? filter, 0);
 	} else {
 		await sendCategoryOverview(env, chatId, null);
 	}
@@ -879,26 +1251,27 @@ async function sendCategoryOverview(env, chatId, editMsgId) {
 	const total = rows.reduce((sum, r) => sum + r.cnt, 0);
 
 	if (total === 0) {
-		const msg = '📂 No files stored yet. Send a file to get started!';
+		const msg = t('noFilesYet');
 		if (editMsgId) await editMessage(env.BOT_TOKEN, chatId, editMsgId, msg);
 		else await sendMessage(env.BOT_TOKEN, chatId, msg);
 		return;
 	}
 
 	const buttons = CATEGORIES.filter((c) => counts[c.key]).map((c) => ({
-		text: `${c.emoji} ${c.key} · ${counts[c.key]}`,
+		text: `${c.emoji} ${categoryName(c.key)} · ${counts[c.key]}`,
 		callback_data: `page:0:${c.key}`,
 	}));
 	if (counts['']) {
-		buttons.push({ text: `❔ ${UNCATEGORIZED} · ${counts['']}`, callback_data: `page:0:${UNCATEGORIZED}` });
+		buttons.push({ text: `❔ ${t('uncategorized')} · ${counts['']}`, callback_data: `page:0:${UNCATEGORIZED}` });
 	}
 
 	const keyboard = [];
 	for (let i = 0; i < buttons.length; i += 2) keyboard.push(buttons.slice(i, i + 2));
-	keyboard.push([{ text: `📂 All files · ${total}`, callback_data: 'page:0' }]);
+	keyboard.push([{ text: t('btnAllFiles', total), callback_data: 'page:0' }]);
 
-	let text = `🗂 <b>Categories</b>\n${total} file${total !== 1 ? 's' : ''} in ${buttons.length} categor${buttons.length !== 1 ? 'ies' : 'y'}`;
-	if (counts['']) text += `\n\n❔ ${counts['']} uncategorized — send /classify to sort them`;
+	const catCount = CATEGORIES.filter((c) => counts[c.key]).length;
+	let text = `<b>${t('categoriesTitle')}</b>\n<i>${t('categoriesSubtitle', total, catCount)}</i>`;
+	if (counts['']) text += `\n\n${t('uncategorizedHint', counts[''])}`;
 
 	const extra = { reply_markup: { inline_keyboard: keyboard } };
 	if (editMsgId) await editMessage(env.BOT_TOKEN, chatId, editMsgId, text, extra);
@@ -985,7 +1358,7 @@ function numberButtons(files, callbackFor, start = 1) {
 async function sendFilePicker(env, chatId, title, files, callbackFor) {
 	const text = formatFileList(
 		title,
-		'Tap a number',
+		t('tapNumber'),
 		files.map((f, i) => formatFileEntry(f, i + 1)),
 	);
 	await sendMessage(env.BOT_TOKEN, chatId, text, { reply_markup: { inline_keyboard: numberButtons(files, callbackFor) } });
@@ -1025,14 +1398,14 @@ async function queryFilePage(env, filter, page) {
 
 async function sendFileList(env, chatId, editMsgId, filter, page) {
 	const { files, total, isCategory } = await queryFilePage(env, filter, page);
-	const back = [{ text: '🗂 Categories', callback_data: 'cats' }];
+	const back = [{ text: t('btnCategories'), callback_data: 'cats' }];
 
 	if (total === 0) {
 		const msg = isCategory
-			? `📂 No files in <b>${escapeHtml(filter)}</b>`
+			? t('noFilesInCategory', escapeHtml(categoryName(filter === UNCATEGORIZED ? '' : filter)))
 			: filter
-				? `📂 No files found with tag <b>${escapeHtml(filter)}</b>`
-				: '📂 No files stored yet. Send a file to get started!';
+				? t('noFilesWithTag', escapeHtml(filter))
+				: t('noFilesYet');
 		const extra = { reply_markup: { inline_keyboard: [back] } };
 		if (editMsgId) await editMessage(env.BOT_TOKEN, chatId, editMsgId, msg, extra);
 		else await sendMessage(env.BOT_TOKEN, chatId, msg, extra);
@@ -1045,10 +1418,10 @@ async function sendFileList(env, chatId, editMsgId, filter, page) {
 		? escapeHtml(categoryLabel(filter === UNCATEGORIZED ? '' : filter))
 		: filter
 			? `🏷 ${escapeHtml(filter)}`
-			: '📂 All files';
-	const subtitle = `${total} file${total !== 1 ? 's' : ''}${totalPages > 1 ? ` · page ${page + 1} of ${totalPages}` : ''}`;
+			: t('allFilesTitle');
+	const subtitle = t('listSubtitle', total, page + 1, totalPages);
 	const entries = files.map((f, i) => formatFileEntry(f, page * PAGE_SIZE + i + 1, { showCategory: !isCategory }));
-	const text = formatFileList(title, subtitle, entries, '<i>Tap a number to get that file.</i>');
+	const text = formatFileList(title, subtitle, entries, `<i>${t('tapToGet')}</i>`);
 
 	// Inline keyboard: numbered file buttons (5 per row), then navigation
 	const keyboard = numberButtons(files, (f) => `get:${f.id}`, page * PAGE_SIZE + 1);
@@ -1057,7 +1430,7 @@ async function sendFileList(env, chatId, editMsgId, filter, page) {
 	const nav = [];
 	if (page > 0) nav.push({ text: '⬅️', callback_data: `page:${page - 1}${param}` });
 	if (files.some(isPreviewable)) {
-		nav.push({ text: '🖼 Preview', callback_data: `prev:${page}${param}` });
+		nav.push({ text: t('btnPreview'), callback_data: `prev:${page}${param}` });
 	}
 	if (page < totalPages - 1) nav.push({ text: '➡️', callback_data: `page:${page + 1}${param}` });
 	if (nav.length) keyboard.push(nav);
@@ -1168,7 +1541,12 @@ async function aiSearchFileIds(env, query) {
 	]);
 	if (rows.length === 0) return [];
 
-	const list = rows.map((r) => [r.id, r.file_name, r.category || UNCATEGORIZED, r.tags].filter(Boolean).join(' | ')).join('\n');
+	// Both category names, so queries in either language match
+	const bothNames = (key) => {
+		const c = CATEGORIES.find((x) => x.key === key);
+		return c ? `${c.zh}/${c.en}` : `${UNCATEGORIZED}/Uncategorized`;
+	};
+	const list = rows.map((r) => [r.id, r.file_name, bothNames(r.category), r.tags].filter(Boolean).join(' | ')).join('\n');
 
 	try {
 		const res = await env.AI.run(AI_MODEL, {
@@ -1216,14 +1594,14 @@ function parseIds(content) {
 async function handleGet(env, chatId, args) {
 	const keyword = args.trim();
 	if (!keyword) {
-		await sendMessage(env.BOT_TOKEN, chatId, 'Usage: <code>/get &lt;name&gt;</code>\nPartial names work. If nothing matches, AI searches by meaning.');
+		await sendMessage(env.BOT_TOKEN, chatId, t('getUsage'));
 		return;
 	}
 
 	const { files, via } = await findFiles(env, keyword);
 
 	if (files.length === 0) {
-		await sendMessage(env.BOT_TOKEN, chatId, `❌ No files matching <b>${escapeHtml(keyword)}</b>, and AI search found nothing either.`);
+		await sendMessage(env.BOT_TOKEN, chatId, t('getNothing', escapeHtml(keyword)));
 		return;
 	}
 
@@ -1232,7 +1610,7 @@ async function handleGet(env, chatId, args) {
 		try {
 			await copyMessage(env.BOT_TOKEN, chatId, env.CHANNEL_ID, files[0].message_id);
 		} catch {
-			await sendMessage(env.BOT_TOKEN, chatId, '❌ Failed to retrieve file. It may have been deleted from the channel.');
+			await sendMessage(env.BOT_TOKEN, chatId, t('retrieveFailed'));
 		}
 		return;
 	}
@@ -1240,16 +1618,16 @@ async function handleGet(env, chatId, args) {
 	const text =
 		via === 'ai'
 			? formatFileList(
-					'🤖 AI suggestions',
-					`No file name contains “${escapeHtml(keyword)}”`,
+					t('aiSuggestions'),
+					t('aiNoNameMatch', escapeHtml(keyword)),
 					files.map((f, i) => formatFileEntry(f, i + 1)),
-					'<i>Tap a number to get that file.</i>',
+					`<i>${t('tapToGet')}</i>`,
 				)
 			: formatFileList(
-					`🔍 ${files.length} files match “${escapeHtml(keyword)}”`,
+					t('filesMatch', files.length, escapeHtml(keyword)),
 					'',
 					files.map((f, i) => formatFileEntry(f, i + 1)),
-					'<i>Tap a number to get that file.</i>',
+					`<i>${t('tapToGet')}</i>`,
 				);
 	await sendMessage(env.BOT_TOKEN, chatId, text, { reply_markup: { inline_keyboard: numberButtons(files, (f) => `get:${f.id}`) } });
 }
@@ -1259,7 +1637,7 @@ async function handleGet(env, chatId, args) {
 async function handleDelete(env, chatId, args) {
 	const keyword = args.trim();
 	if (!keyword) {
-		await sendMessage(env.BOT_TOKEN, chatId, 'Usage: <code>/delete &lt;name&gt;</code>');
+		await sendMessage(env.BOT_TOKEN, chatId, t('deleteUsage'));
 		return;
 	}
 
@@ -1276,7 +1654,7 @@ async function handleDelete(env, chatId, args) {
 	const matches = await dbAll(env.DB, `SELECT ${ENTRY_COLS} FROM files WHERE file_name LIKE ? LIMIT 5`, [pattern]);
 
 	if (matches.length === 0) {
-		await sendMessage(env.BOT_TOKEN, chatId, `❌ No files matching <b>${escapeHtml(keyword)}</b>`);
+		await sendMessage(env.BOT_TOKEN, chatId, t('noMatch', escapeHtml(keyword)));
 		return;
 	}
 
@@ -1285,16 +1663,16 @@ async function handleDelete(env, chatId, args) {
 		return;
 	}
 
-	await sendFilePicker(env, chatId, '🗑 Which file do you want to delete?', matches, (m) => `del:${m.id}`);
+	await sendFilePicker(env, chatId, t('pickDelete'), matches, (m) => `del:${m.id}`);
 }
 
 async function sendDeleteConfirmation(env, chatId, file) {
-	await sendMessage(env.BOT_TOKEN, chatId, `Delete <b>${escapeHtml(file.file_name)}</b>?`, {
+	await sendMessage(env.BOT_TOKEN, chatId, t('deleteConfirm', escapeHtml(file.file_name)), {
 		reply_markup: {
 			inline_keyboard: [
 				[
-					{ text: '✅ Confirm', callback_data: `confirm_del:${file.id}` },
-					{ text: '❌ Cancel', callback_data: 'cancel' },
+					{ text: t('confirm'), callback_data: `confirm_del:${file.id}` },
+					{ text: t('cancel'), callback_data: 'cancel' },
 				],
 			],
 		},
@@ -1306,7 +1684,7 @@ async function sendDeleteConfirmation(env, chatId, file) {
 async function handleTag(env, chatId, args) {
 	const parts = args.trim().split(/\s+/);
 	if (parts.length < 2) {
-		await sendMessage(env.BOT_TOKEN, chatId, 'Usage: <code>/tag &lt;name&gt; &lt;tag&gt;...</code>');
+		await sendMessage(env.BOT_TOKEN, chatId, t('tagUsage'));
 		return;
 	}
 
@@ -1326,7 +1704,7 @@ async function handleTag(env, chatId, args) {
 	const matches = await dbAll(env.DB, `SELECT ${ENTRY_COLS} FROM files WHERE file_name LIKE ? LIMIT 5`, [pattern]);
 
 	if (matches.length === 0) {
-		await sendMessage(env.BOT_TOKEN, chatId, `❌ No files matching <b>${escapeHtml(fileName)}</b>`);
+		await sendMessage(env.BOT_TOKEN, chatId, t('noMatch', escapeHtml(fileName)));
 		return;
 	}
 
@@ -1335,7 +1713,7 @@ async function handleTag(env, chatId, args) {
 		return;
 	}
 
-	await sendFilePicker(env, chatId, '🏷 Which file do you want to tag?', matches, (m) => `tag:${m.id}:${newTags.join(',')}`);
+	await sendFilePicker(env, chatId, t('pickTag'), matches, (m) => `tag:${m.id}:${newTags.join(',')}`);
 }
 
 async function applyTags(env, chatId, file, newTags) {
@@ -1347,15 +1725,15 @@ async function applyTags(env, chatId, file, newTags) {
 	await sendMessage(
 		env.BOT_TOKEN,
 		chatId,
-		`🏷 Tags updated\n📄 <b>${escapeHtml(file.file_name)}</b>\nTags: ${merged.map((t) => `#${t}`).join(' ')}`,
+		t('tagsUpdated', escapeHtml(file.file_name), merged.map((tag) => `#${tag}`).join(' ')),
 	);
 }
 
 // ---- /rename ----
 
-// Start of the force-reply prompt; a reply to a bot message starting with
-// this is treated as the new name (the file id is on the prompt's last line).
-const RENAME_PROMPT = '✏️ Reply with a new name for';
+// Start of the force-reply prompt (either language); a reply to a bot message
+// starting with one is the new name (the file id is on the prompt's last line).
+const RENAME_PROMPTS = [STRINGS.en.renamePrompt, STRINGS.zh.renamePrompt];
 
 /**
  * /rename <name> <new>  → rename directly (both names without spaces)
@@ -1364,7 +1742,7 @@ const RENAME_PROMPT = '✏️ Reply with a new name for';
 async function handleRename(env, chatId, args) {
 	const query = args.trim();
 	if (!query) {
-		await sendMessage(env.BOT_TOKEN, chatId, 'Usage: <code>/rename &lt;name&gt; [&lt;new&gt;]</code>\nWithout &lt;new&gt;, the bot asks for it.');
+		await sendMessage(env.BOT_TOKEN, chatId, t('renameUsage'));
 		return;
 	}
 
@@ -1382,7 +1760,7 @@ async function handleRename(env, chatId, args) {
 	const matches = exact ? [exact] : await dbAll(env.DB, `SELECT ${ENTRY_COLS} FROM files WHERE file_name LIKE ? LIMIT 5`, [`%${query}%`]);
 
 	if (matches.length === 0) {
-		await sendMessage(env.BOT_TOKEN, chatId, `❌ No files matching <b>${escapeHtml(query)}</b>`);
+		await sendMessage(env.BOT_TOKEN, chatId, t('noMatch', escapeHtml(query)));
 		return;
 	}
 	if (matches.length === 1) {
@@ -1390,14 +1768,14 @@ async function handleRename(env, chatId, args) {
 		return;
 	}
 
-	await sendFilePicker(env, chatId, '✏️ Which file do you want to rename?', matches, (m) => `ren:${m.id}`);
+	await sendFilePicker(env, chatId, t('pickRename'), matches, (m) => `ren:${m.id}`);
 }
 
 async function sendRenamePrompt(env, chatId, file) {
 	await sendMessage(
 		env.BOT_TOKEN,
 		chatId,
-		`${RENAME_PROMPT} <b>${escapeHtml(file.file_name)}</b>\n<i>Leave out the extension to keep it.</i>\n#${file.id}`,
+		`${t('renamePrompt')} <b>${escapeHtml(file.file_name)}</b>\n<i>${t('renameKeepExt')}</i>\n#${file.id}`,
 		{ reply_markup: { force_reply: true, input_field_placeholder: file.file_name.slice(0, 64) } },
 	);
 }
@@ -1408,29 +1786,29 @@ async function sendRenamePrompt(env, chatId, file) {
 async function applyRename(env, chatId, fileId, rawName) {
 	const file = await dbFirst(env.DB, 'SELECT id, file_name, mime_type FROM files WHERE id = ?', [fileId]);
 	if (!file) {
-		await sendMessage(env.BOT_TOKEN, chatId, '❌ That file no longer exists.');
+		await sendMessage(env.BOT_TOKEN, chatId, t('fileGone'));
 		return;
 	}
 
 	let newName = sanitizeFileName(rawName);
 	if (!newName) {
-		await sendMessage(env.BOT_TOKEN, chatId, '❌ The new name is empty.');
+		await sendMessage(env.BOT_TOKEN, chatId, t('nameEmpty'));
 		return;
 	}
 	if (!/\.[a-z0-9]{1,5}$/i.test(newName)) newName += fileExtension(file.file_name, file.mime_type ?? '');
 	if (newName === file.file_name) {
-		await sendMessage(env.BOT_TOKEN, chatId, `Name unchanged: <b>${escapeHtml(newName)}</b>`);
+		await sendMessage(env.BOT_TOKEN, chatId, t('nameUnchanged', escapeHtml(newName)));
 		return;
 	}
 
 	const conflict = await dbFirst(env.DB, 'SELECT id FROM files WHERE file_name = ? AND id != ?', [newName, file.id]);
 	if (conflict) {
-		await sendMessage(env.BOT_TOKEN, chatId, `❌ A file named <b>${escapeHtml(newName)}</b> already exists.`);
+		await sendMessage(env.BOT_TOKEN, chatId, t('nameTaken', escapeHtml(newName)));
 		return;
 	}
 
 	await dbRun(env.DB, 'UPDATE files SET file_name = ? WHERE id = ?', [newName, file.id]);
-	await sendMessage(env.BOT_TOKEN, chatId, `✏️ Renamed\n<b>${escapeHtml(file.file_name)}</b> → <b>${escapeHtml(newName)}</b>`, {
+	await sendMessage(env.BOT_TOKEN, chatId, t('renamed', escapeHtml(file.file_name), escapeHtml(newName)), {
 		reply_markup: fileActionsKeyboard(file.id),
 	});
 }
@@ -1440,7 +1818,7 @@ async function applyRename(env, chatId, fileId, rawName) {
 async function handleSetCategory(env, chatId, args) {
 	const keyword = args.trim();
 	if (!keyword) {
-		await sendMessage(env.BOT_TOKEN, chatId, 'Usage: <code>/cat &lt;name&gt;</code>\nShows category buttons for that file.');
+		await sendMessage(env.BOT_TOKEN, chatId, t('catUsage'));
 		return;
 	}
 
@@ -1450,7 +1828,7 @@ async function handleSetCategory(env, chatId, args) {
 		: await dbAll(env.DB, `SELECT ${ENTRY_COLS} FROM files WHERE file_name LIKE ? LIMIT 5`, [`%${keyword}%`]);
 
 	if (matches.length === 0) {
-		await sendMessage(env.BOT_TOKEN, chatId, `❌ No files matching <b>${escapeHtml(keyword)}</b>`);
+		await sendMessage(env.BOT_TOKEN, chatId, t('noMatch', escapeHtml(keyword)));
 		return;
 	}
 
@@ -1459,11 +1837,11 @@ async function handleSetCategory(env, chatId, args) {
 		return;
 	}
 
-	await sendFilePicker(env, chatId, '🗂 Which file do you want to recategorize?', matches, (m) => `catmenu:${m.id}`);
+	await sendFilePicker(env, chatId, t('pickCategory'), matches, (m) => `catmenu:${m.id}`);
 }
 
 async function sendCategoryMenu(env, chatId, editMsgId, file) {
-	const text = `🗂 Pick a category for <b>${escapeHtml(file.file_name)}</b>\nCurrent: ${categoryLabel(file.category)}`;
+	const text = t('pickCategoryFor', escapeHtml(file.file_name), categoryLabel(file.category));
 	const extra = { reply_markup: categoryKeyboard(file.id) };
 	if (editMsgId) {
 		await editMessage(env.BOT_TOKEN, chatId, editMsgId, text, extra);
@@ -1482,7 +1860,7 @@ async function handleClassify(env, chatId, editMsgId = null) {
 	const { results, remaining } = await classifyPendingBatch(env);
 
 	if (results.length === 0) {
-		const msg = '✅ Every file has a category and a real name.';
+		const msg = t('classifyAllGood');
 		if (editMsgId) await editMessage(env.BOT_TOKEN, chatId, editMsgId, msg);
 		else await sendMessage(env.BOT_TOKEN, chatId, msg);
 		return;
@@ -1490,17 +1868,17 @@ async function handleClassify(env, chatId, editMsgId = null) {
 
 	const entries = results.map((r, i) =>
 		formatFileEntry({ file_name: r.name, mime_type: r.mimeType, category: r.category }, i + 1, {
-			note: r.oldName !== r.name ? `was ${escapeHtml(r.oldName)}` : '',
+			note: r.oldName !== r.name ? t('was', escapeHtml(r.oldName)) : '',
 		}),
 	);
 	const text = formatFileList(
-		`🗂 Processed ${results.length} file${results.length !== 1 ? 's' : ''}`,
-		remaining > 0 ? `${remaining} left` : 'All done',
+		t('processed', results.length),
+		remaining > 0 ? t('left', remaining) : t('allDone'),
 		entries,
-		remaining > 0 ? '<i>Tap Continue for the next batch.</i>' : '✅ Every file has a category and a real name.',
+		remaining > 0 ? `<i>${t('tapContinue')}</i>` : t('classifyAllGood'),
 	);
 
-	const extra = remaining > 0 ? { reply_markup: { inline_keyboard: [[{ text: '▶️ Continue', callback_data: 'classify_more' }]] } } : {};
+	const extra = remaining > 0 ? { reply_markup: { inline_keyboard: [[{ text: t('btnContinue'), callback_data: 'classify_more' }]] } } : {};
 	if (editMsgId) await editMessage(env.BOT_TOKEN, chatId, editMsgId, text, extra);
 	else await sendMessage(env.BOT_TOKEN, chatId, text, extra);
 }
@@ -1554,6 +1932,40 @@ async function classifyPendingBatch(env) {
 	return { results, remaining: needsWork.length - batch.length };
 }
 
+// ---- /lang ----
+
+/**
+ * /lang          → show the current language with switch buttons
+ * /lang en | zh  → switch. Stored keys and existing file names never change;
+ *                  only labels, messages and new auto-names follow the language.
+ */
+async function handleLang(env, chatId, args, editMsgId = null) {
+	const aliases = { english: 'en', 英文: 'en', chinese: 'zh', 中文: 'zh', cn: 'zh', 'zh-cn': 'zh' };
+	const input = args.trim().toLowerCase();
+	const wanted = validLang(aliases[input] ?? input);
+
+	if (wanted) {
+		await dbRun(env.DB, "INSERT INTO settings (key, value) VALUES ('lang', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", [wanted]);
+		await langStore.run(wanted, async () => {
+			const text = t('langSet', LANGUAGES[wanted]);
+			if (editMsgId) await editMessage(env.BOT_TOKEN, chatId, editMsgId, text);
+			else await sendMessage(env.BOT_TOKEN, chatId, text);
+			try {
+				await tg(env.BOT_TOKEN, 'setMyCommands', { commands: botCommands() });
+			} catch (err) {
+				console.error('setMyCommands failed:', err);
+			}
+		});
+		return;
+	}
+
+	const buttons = Object.entries(LANGUAGES).map(([code, name]) => ({
+		text: `${code === currentLang() ? '✓ ' : ''}${name}`,
+		callback_data: `lang:${code}`,
+	}));
+	await sendMessage(env.BOT_TOKEN, chatId, t('langCurrent', LANGUAGES[currentLang()]), { reply_markup: { inline_keyboard: [buttons] } });
+}
+
 // ---- /stats ----
 
 async function handleStats(env, chatId) {
@@ -1576,14 +1988,13 @@ async function handleStats(env, chatId) {
 		[],
 	);
 
-	let text = `📊 <b>Storage Statistics</b>\n\n`;
-	text += `📁 Total files: <b>${count}</b>\n`;
-	text += `💾 Total size: <b>${formatFileSize(totalSize)}</b>\n`;
+	let text = `${t('statsTitle')}\n\n${t('statsFiles', count)}\n${t('statsSize', formatFileSize(totalSize))}\n`;
 
+	const typeNames = { Images: t('typeImages'), Videos: t('typeVideos'), Audio: t('typeAudio'), Other: t('typeOther') };
 	if (typeRows.length > 0) {
-		text += `\n<b>By type:</b>\n`;
+		text += `\n${t('statsByType')}\n`;
 		for (const r of typeRows) {
-			text += `  • ${r.category}: ${r.cnt}\n`;
+			text += `  • ${typeNames[r.category] ?? r.category}: ${r.cnt}\n`;
 		}
 	}
 
@@ -1593,7 +2004,7 @@ async function handleStats(env, chatId) {
 		[],
 	);
 	if (catRows.length > 0) {
-		text += `\n<b>By category:</b>\n`;
+		text += `\n${t('statsByCategory')}\n`;
 		for (const r of catRows) {
 			text += `  • ${categoryLabel(r.category)}: ${r.cnt}\n`;
 		}
@@ -1618,7 +2029,7 @@ async function handleCallback(env, callback) {
 
 	// Auth check
 	if (String(chatId) !== String(env.ADMIN_ID)) {
-		await answerCallback(env.BOT_TOKEN, callback.id, '⛔ Unauthorized');
+		await answerCallback(env.BOT_TOKEN, callback.id, t('unauthorized'));
 		return;
 	}
 
@@ -1631,7 +2042,7 @@ async function handleCallback(env, callback) {
 				await copyMessage(env.BOT_TOKEN, chatId, env.CHANNEL_ID, file.message_id);
 				await answerCallback(env.BOT_TOKEN, callback.id, file.file_name);
 			} else {
-				await answerCallback(env.BOT_TOKEN, callback.id, 'File not found');
+				await answerCallback(env.BOT_TOKEN, callback.id, t('fileNotFound'));
 			}
 			return;
 		}
@@ -1659,10 +2070,10 @@ async function handleCallback(env, callback) {
 			const file = await dbFirst(env.DB, 'SELECT file_name FROM files WHERE id = ?', [fileId]);
 			if (file) {
 				await dbRun(env.DB, 'DELETE FROM files WHERE id = ?', [fileId]);
-				await editMessage(env.BOT_TOKEN, chatId, msgId, `🗑 Deleted <b>${escapeHtml(file.file_name)}</b>`);
-				await answerCallback(env.BOT_TOKEN, callback.id, 'Deleted');
+				await editMessage(env.BOT_TOKEN, chatId, msgId, t('deleted', escapeHtml(file.file_name)));
+				await answerCallback(env.BOT_TOKEN, callback.id, t('deletedToast'));
 			} else {
-				await answerCallback(env.BOT_TOKEN, callback.id, 'Already deleted');
+				await answerCallback(env.BOT_TOKEN, callback.id, t('alreadyDeleted'));
 			}
 			return;
 		}
@@ -1672,15 +2083,15 @@ async function handleCallback(env, callback) {
 			const fileId = parseInt(data.split(':')[1], 10);
 			const file = await dbFirst(env.DB, 'SELECT id, file_name FROM files WHERE id = ?', [fileId]);
 			if (file) {
-				await editMessage(env.BOT_TOKEN, chatId, msgId, `Delete <b>${escapeHtml(file.file_name)}</b>?`, {
+				await editMessage(env.BOT_TOKEN, chatId, msgId, t('deleteConfirm', escapeHtml(file.file_name)), {
 					reply_markup: {
 						inline_keyboard: [
 							[
 								{
-									text: '✅ Confirm',
+									text: t('confirm'),
 									callback_data: `confirm_del:${file.id}`,
 								},
-								{ text: '❌ Cancel', callback_data: 'cancel' },
+								{ text: t('cancel'), callback_data: 'cancel' },
 							],
 						],
 					},
@@ -1699,14 +2110,14 @@ async function handleCallback(env, callback) {
 			if (file) {
 				await applyTags(env, chatId, file, newTags);
 			}
-			await answerCallback(env.BOT_TOKEN, callback.id, 'Tags updated');
+			await answerCallback(env.BOT_TOKEN, callback.id, t('tagsUpdatedToast'));
 			return;
 		}
 
 		// File detail card (from an album summary)
 		if (data.startsWith('file:')) {
 			const found = await sendFileCard(env, chatId, parseInt(data.split(':')[1], 10));
-			await answerCallback(env.BOT_TOKEN, callback.id, found ? '' : 'File not found');
+			await answerCallback(env.BOT_TOKEN, callback.id, found ? '' : t('fileNotFound'));
 			return;
 		}
 
@@ -1718,8 +2129,15 @@ async function handleCallback(env, callback) {
 				await sendRenamePrompt(env, chatId, file);
 				await answerCallback(env.BOT_TOKEN, callback.id);
 			} else {
-				await answerCallback(env.BOT_TOKEN, callback.id, 'File not found');
+				await answerCallback(env.BOT_TOKEN, callback.id, t('fileNotFound'));
 			}
+			return;
+		}
+
+		// Switch language
+		if (data.startsWith('lang:')) {
+			await handleLang(env, chatId, data.slice(5), msgId);
+			await answerCallback(env.BOT_TOKEN, callback.id);
 			return;
 		}
 
@@ -1736,7 +2154,7 @@ async function handleCallback(env, callback) {
 			const colonIdx = rest.indexOf(':');
 			const page = parseInt(colonIdx > -1 ? rest.slice(0, colonIdx) : rest, 10);
 			const filter = colonIdx > -1 ? rest.slice(colonIdx + 1) : '';
-			await answerCallback(env.BOT_TOKEN, callback.id, 'Sending previews…');
+			await answerCallback(env.BOT_TOKEN, callback.id, t('sendingPreviews'));
 			await sendPagePreview(env, chatId, filter, page);
 			return;
 		}
@@ -1749,7 +2167,7 @@ async function handleCallback(env, callback) {
 				await sendCategoryMenu(env, chatId, msgId, file);
 				await answerCallback(env.BOT_TOKEN, callback.id);
 			} else {
-				await answerCallback(env.BOT_TOKEN, callback.id, 'File not found');
+				await answerCallback(env.BOT_TOKEN, callback.id, t('fileNotFound'));
 			}
 			return;
 		}
@@ -1760,33 +2178,33 @@ async function handleCallback(env, callback) {
 			const fileId = parseInt(rawId, 10);
 			const file = await dbFirst(env.DB, 'SELECT id, file_name FROM files WHERE id = ?', [fileId]);
 			if (!file || !CATEGORY_KEYS.includes(key)) {
-				await answerCallback(env.BOT_TOKEN, callback.id, 'File not found');
+				await answerCallback(env.BOT_TOKEN, callback.id, t('fileNotFound'));
 				return;
 			}
 			await dbRun(env.DB, 'UPDATE files SET category = ? WHERE id = ?', [key, fileId]);
-			await editMessage(env.BOT_TOKEN, chatId, msgId, `🗂 <b>${escapeHtml(file.file_name)}</b> → ${categoryLabel(key)}`, {
+			await editMessage(env.BOT_TOKEN, chatId, msgId, t('recategorized', escapeHtml(file.file_name), categoryLabel(key)), {
 				reply_markup: fileActionsKeyboard(fileId),
 			});
-			await answerCallback(env.BOT_TOKEN, callback.id, key);
+			await answerCallback(env.BOT_TOKEN, callback.id, categoryName(key));
 			return;
 		}
 
 		// Next batch of /classify
 		if (data === 'classify_more') {
-			await answerCallback(env.BOT_TOKEN, callback.id, 'Classifying…');
+			await answerCallback(env.BOT_TOKEN, callback.id, t('classifying'));
 			await handleClassify(env, chatId, msgId);
 			return;
 		}
 
 		// Cancel
 		if (data === 'cancel') {
-			await editMessage(env.BOT_TOKEN, chatId, msgId, 'Cancelled.');
+			await editMessage(env.BOT_TOKEN, chatId, msgId, t('cancelled'));
 			await answerCallback(env.BOT_TOKEN, callback.id);
 			return;
 		}
 	} catch (err) {
 		console.error('Callback handler error:', err);
-		await answerCallback(env.BOT_TOKEN, callback.id, '⚠️ An error occurred');
+		await answerCallback(env.BOT_TOKEN, callback.id, t('error'));
 	}
 }
 
@@ -1800,7 +2218,7 @@ async function handleMessage(env, message, ctx) {
 
 	// Auth: only the admin can interact
 	if (String(chatId) !== String(env.ADMIN_ID)) {
-		await sendMessage(env.BOT_TOKEN, chatId, '⛔ Unauthorized');
+		await sendMessage(env.BOT_TOKEN, chatId, t('unauthorized'));
 		return;
 	}
 
@@ -1825,7 +2243,7 @@ async function handleMessage(env, message, ctx) {
 
 	// Reply to a rename prompt → the text is the new name
 	const prompt = message.reply_to_message;
-	if (prompt?.from?.is_bot && (prompt.text ?? '').startsWith(RENAME_PROMPT) && !text.startsWith('/')) {
+	if (prompt?.from?.is_bot && RENAME_PROMPTS.some((p) => (prompt.text ?? '').startsWith(p)) && !text.startsWith('/')) {
 		const idMatch = prompt.text.match(/#(\d+)\s*$/);
 		if (idMatch) {
 			await applyRename(env, chatId, parseInt(idMatch[1], 10), text);
@@ -1875,6 +2293,9 @@ async function handleMessage(env, message, ctx) {
 		case 'classify':
 			await handleClassify(env, chatId);
 			break;
+		case 'lang':
+			await handleLang(env, chatId, args);
+			break;
 		default:
 			// Unknown command — silently ignore
 			break;
@@ -1902,7 +2323,7 @@ export default {
 				allowed_updates: ['message', 'callback_query'],
 				drop_pending_updates: true,
 			});
-			await tg(env.BOT_TOKEN, 'setMyCommands', { commands: BOT_COMMANDS });
+			await langStore.run(await resolveLang(env), () => tg(env.BOT_TOKEN, 'setMyCommands', { commands: botCommands() }));
 			return Response.json(result, { status: 200 });
 		}
 
@@ -1928,11 +2349,14 @@ export default {
 			}
 
 			try {
-				if (update.message) {
-					await handleMessage(env, update.message, ctx);
-				} else if (update.callback_query) {
-					await handleCallback(env, update.callback_query);
-				}
+				// Everything for this update (including ctx.waitUntil work) runs in its language
+				await langStore.run(await resolveLang(env), async () => {
+					if (update.message) {
+						await handleMessage(env, update.message, ctx);
+					} else if (update.callback_query) {
+						await handleCallback(env, update.callback_query);
+					}
+				});
 			} catch (err) {
 				console.error('Error processing update:', err);
 				// Still return 200 to prevent Telegram from retrying

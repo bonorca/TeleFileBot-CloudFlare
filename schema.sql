@@ -32,3 +32,9 @@ CREATE INDEX IF NOT EXISTS idx_uploaded_at    ON files(uploaded_at);
 CREATE INDEX IF NOT EXISTS idx_mime_type      ON files(mime_type);
 CREATE INDEX IF NOT EXISTS idx_category       ON files(category);
 CREATE INDEX IF NOT EXISTS idx_media_group_id ON files(media_group_id);
+
+-- Bot settings, e.g. key 'lang' = 'en' | 'zh' (set with /lang)
+CREATE TABLE IF NOT EXISTS settings (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
