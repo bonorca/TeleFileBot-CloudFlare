@@ -791,7 +791,7 @@ async function scheduleAlbumSummary(env, chatId, groupId, ctx) {
 }
 
 async function sendAlbumSummary(env, chatId, groupId) {
-	const files = await dbAll(env.DB, 'SELECT id, file_name, file_size, category FROM files WHERE media_group_id = ? ORDER BY id', [groupId]);
+	const files = await dbAll(env.DB, 'SELECT id, file_name, file_size, mime_type, category FROM files WHERE media_group_id = ? ORDER BY id', [groupId]);
 	const group = await dbFirst(env.DB, 'SELECT caption, dup_count FROM media_groups WHERE group_id = ?', [groupId]);
 	const dups = group?.dup_count ?? 0;
 
@@ -806,20 +806,18 @@ async function sendAlbumSummary(env, chatId, groupId) {
 			.map(([cat, n]) => `${categoryLabel(cat)} ×${n}`)
 			.join(' · ');
 
-		text = `📦 Saved ${files.length} file${files.length !== 1 ? 's' : ''} from an album\n🗂 ${breakdown}`;
-		if (group?.caption) text += `\n💬 <i>${escapeHtml(group.caption)}</i>`;
-		if (dups) text += `\n⚠️ ${dups} already saved, skipped`;
-		text += '\n\n';
-		files.forEach((f, i) => {
-			text += `<b>${i + 1}.</b> ${escapeHtml(f.file_name)} · ${categoryLabel(f.category)}\n`;
-		});
-		text += '\n<i>Tap a number to rename, recategorize or get a file.</i>';
+		let subtitle = escapeHtml(breakdown);
+		if (group?.caption) subtitle += `\n💬 ${escapeHtml(group.caption)}`;
+		if (dups) subtitle += `\n⚠️ ${dups} already saved, skipped`;
+		text = formatFileList(
+			`📦 Saved ${files.length} file${files.length !== 1 ? 's' : ''} from an album`,
+			subtitle,
+			files.map((f, i) => formatFileEntry(f, i + 1)),
+			'<i>Tap a number to rename, recategorize or get a file.</i>',
+		);
 	}
 
-	const buttons = files.map((f, i) => ({ text: String(i + 1), callback_data: `file:${f.id}` }));
-	const keyboard = [];
-	for (let i = 0; i < buttons.length; i += 5) keyboard.push(buttons.slice(i, i + 5));
-	const extra = { reply_markup: { inline_keyboard: keyboard } };
+	const extra = { reply_markup: { inline_keyboard: numberButtons(files, (f) => `file:${f.id}`) } };
 
 	// Claim the right to send; whoever loses edits the message instead
 	const claim = await dbRun(env.DB, 'UPDATE media_groups SET summary_msg_id = -1 WHERE group_id = ? AND summary_msg_id IS NULL', [
@@ -921,6 +919,81 @@ function fileIcon(mimeType = '') {
 	return '📄';
 }
 
+// ---- List layout ----
+//
+// Every file list uses the same shape:
+//
+//   <b>Title</b>
+//   <i>subtitle</i>
+//   ━━━━━━━━━━━━━━
+//
+//   1. 🖼 name.jpg
+//   💰 财务 · 42.9 KB · 11-14
+//
+//   2. 📄 other.pdf
+//   ...
+
+const LIST_RULE = '━━━━━━━━━━━━━━';
+
+/** "11-14" for this year, "2025-11-14" otherwise. */
+function shortDate(uploadedAt) {
+	const day = (uploadedAt ?? '').slice(0, 10);
+	if (!day) return '';
+	return day.slice(0, 4) === new Date().toISOString().slice(0, 4) ? day.slice(5) : day;
+}
+
+/**
+ * One list entry: number, type icon and name, then an italic detail line.
+ * Missing fields are simply left out.
+ */
+function formatFileEntry(f, idx, { showCategory = true, note = '' } = {}) {
+	const meta = [];
+	if (showCategory && f.category !== undefined) meta.push(categoryLabel(f.category));
+	if (f.file_size) meta.push(formatFileSize(f.file_size));
+	if (f.uploaded_at) meta.push(shortDate(f.uploaded_at));
+	if (f.tags) meta.push(`🏷 ${f.tags}`);
+
+	let entry = `<b>${idx}.</b> ${fileIcon(f.mime_type)} ${escapeHtml(f.file_name)}`;
+	if (meta.length) entry += `\n<i>${escapeHtml(meta.join(' · '))}</i>`;
+	if (note) entry += `\n<i>${note}</i>`;
+	return entry;
+}
+
+/**
+ * Title block + entries separated by blank lines (+ optional footer).
+ * `subtitle` and `footer` are HTML.
+ */
+function formatFileList(title, subtitle, entries, footer = '') {
+	let text = `<b>${title}</b>`;
+	if (subtitle) text += `\n<i>${subtitle}</i>`;
+	text += `\n${LIST_RULE}\n\n${entries.join('\n\n')}`;
+	if (footer) text += `\n\n${LIST_RULE}\n${footer}`;
+	return text;
+}
+
+/** Numbered buttons, 5 per row. */
+function numberButtons(files, callbackFor, start = 1) {
+	const buttons = files.map((f, i) => ({ text: String(start + i), callback_data: callbackFor(f) }));
+	const rows = [];
+	for (let i = 0; i < buttons.length; i += 5) rows.push(buttons.slice(i, i + 5));
+	return rows;
+}
+
+/**
+ * "Which file?" list for commands that matched several files.
+ */
+async function sendFilePicker(env, chatId, title, files, callbackFor) {
+	const text = formatFileList(
+		title,
+		'Tap a number',
+		files.map((f, i) => formatFileEntry(f, i + 1)),
+	);
+	await sendMessage(env.BOT_TOKEN, chatId, text, { reply_markup: { inline_keyboard: numberButtons(files, callbackFor) } });
+}
+
+// Columns every list entry needs
+const ENTRY_COLS = 'id, file_name, file_size, mime_type, category, tags, uploaded_at';
+
 /**
  * One page of files for a filter.
  * `filter` is a category key, UNCATEGORIZED, a free-form tag, or '' for all files.
@@ -968,25 +1041,17 @@ async function sendFileList(env, chatId, editMsgId, filter, page) {
 
 	const totalPages = Math.ceil(total / PAGE_SIZE);
 
-	let text = isCategory
-		? `<b>${escapeHtml(categoryLabel(filter === UNCATEGORIZED ? '' : filter))}</b>`
+	const title = isCategory
+		? escapeHtml(categoryLabel(filter === UNCATEGORIZED ? '' : filter))
 		: filter
-			? `🏷 <b>${escapeHtml(filter)}</b>`
-			: '📂 <b>All files</b>';
-	text += `\n${total} file${total !== 1 ? 's' : ''} · page ${page + 1}/${totalPages}\n\n`;
-
-	files.forEach((f, i) => {
-		const idx = page * PAGE_SIZE + i + 1;
-		const meta = [formatFileSize(f.file_size)];
-		if (!isCategory) meta.push(categoryLabel(f.category));
-		if (f.tags) meta.push(`🏷 ${f.tags}`);
-		text += `<b>${idx}.</b> ${fileIcon(f.mime_type)} ${escapeHtml(f.file_name)}\n      <i>${escapeHtml(meta.join(' · '))}</i>\n`;
-	});
+			? `🏷 ${escapeHtml(filter)}`
+			: '📂 All files';
+	const subtitle = `${total} file${total !== 1 ? 's' : ''}${totalPages > 1 ? ` · page ${page + 1} of ${totalPages}` : ''}`;
+	const entries = files.map((f, i) => formatFileEntry(f, page * PAGE_SIZE + i + 1, { showCategory: !isCategory }));
+	const text = formatFileList(title, subtitle, entries, '<i>Tap a number to get that file.</i>');
 
 	// Inline keyboard: numbered file buttons (5 per row), then navigation
-	const keyboard = [];
-	const fileButtons = files.map((f, i) => ({ text: String(page * PAGE_SIZE + i + 1), callback_data: `get:${f.id}` }));
-	for (let i = 0; i < fileButtons.length; i += 5) keyboard.push(fileButtons.slice(i, i + 5));
+	const keyboard = numberButtons(files, (f) => `get:${f.id}`, page * PAGE_SIZE + 1);
 
 	const param = filter ? `:${filter}` : '';
 	const nav = [];
@@ -1060,7 +1125,7 @@ async function sendPagePreview(env, chatId, filter, page) {
  * @returns {Promise<{files: object[], via: 'name' | 'ai'}>}
  */
 async function findFiles(env, keyword) {
-	const cols = 'id, file_name, file_size, message_id';
+	const cols = `${ENTRY_COLS}, message_id`;
 
 	const exact = await dbAll(env.DB, `SELECT ${cols} FROM files WHERE file_name = ? COLLATE NOCASE LIMIT 1`, [keyword]);
 	if (exact.length) return { files: exact, via: 'name' };
@@ -1172,19 +1237,21 @@ async function handleGet(env, chatId, args) {
 		return;
 	}
 
-	let text =
+	const text =
 		via === 'ai'
-			? `🤖 No file name contains <b>${escapeHtml(keyword)}</b>. AI suggests:\n\n`
-			: `🔍 Found ${files.length} matching files:\n\n`;
-	const buttons = [];
-	files.forEach((f, i) => {
-		text += `<b>${i + 1}.</b> ${escapeHtml(f.file_name)} · ${formatFileSize(f.file_size)}\n`;
-		buttons.push({ text: String(i + 1), callback_data: `get:${f.id}` });
-	});
-
-	const keyboard = [];
-	for (let i = 0; i < buttons.length; i += 5) keyboard.push(buttons.slice(i, i + 5));
-	await sendMessage(env.BOT_TOKEN, chatId, text, { reply_markup: { inline_keyboard: keyboard } });
+			? formatFileList(
+					'🤖 AI suggestions',
+					`No file name contains “${escapeHtml(keyword)}”`,
+					files.map((f, i) => formatFileEntry(f, i + 1)),
+					'<i>Tap a number to get that file.</i>',
+				)
+			: formatFileList(
+					`🔍 ${files.length} files match “${escapeHtml(keyword)}”`,
+					'',
+					files.map((f, i) => formatFileEntry(f, i + 1)),
+					'<i>Tap a number to get that file.</i>',
+				);
+	await sendMessage(env.BOT_TOKEN, chatId, text, { reply_markup: { inline_keyboard: numberButtons(files, (f) => `get:${f.id}`) } });
 }
 
 // ---- /delete ----
@@ -1206,7 +1273,7 @@ async function handleDelete(env, chatId, args) {
 
 	// Fuzzy match
 	const pattern = `%${keyword}%`;
-	const matches = await dbAll(env.DB, 'SELECT id, file_name FROM files WHERE file_name LIKE ? LIMIT 5', [pattern]);
+	const matches = await dbAll(env.DB, `SELECT ${ENTRY_COLS} FROM files WHERE file_name LIKE ? LIMIT 5`, [pattern]);
 
 	if (matches.length === 0) {
 		await sendMessage(env.BOT_TOKEN, chatId, `❌ No files matching <b>${escapeHtml(keyword)}</b>`);
@@ -1218,21 +1285,7 @@ async function handleDelete(env, chatId, args) {
 		return;
 	}
 
-	// Multiple candidates
-	let text = '🔍 Which file do you want to delete?\n\n';
-	const buttons = [];
-	for (const m of matches) {
-		text += `📄 ${escapeHtml(m.file_name)}\n`;
-		buttons.push([
-			{
-				text: `🗑 ${truncateForCallback(m.file_name, 30)}`,
-				callback_data: `del:${m.id}`,
-			},
-		]);
-	}
-	await sendMessage(env.BOT_TOKEN, chatId, text, {
-		reply_markup: { inline_keyboard: buttons },
-	});
+	await sendFilePicker(env, chatId, '🗑 Which file do you want to delete?', matches, (m) => `del:${m.id}`);
 }
 
 async function sendDeleteConfirmation(env, chatId, file) {
@@ -1270,7 +1323,7 @@ async function handleTag(env, chatId, args) {
 
 	// Fuzzy match
 	const pattern = `%${fileName}%`;
-	const matches = await dbAll(env.DB, 'SELECT id, file_name, tags FROM files WHERE file_name LIKE ? LIMIT 5', [pattern]);
+	const matches = await dbAll(env.DB, `SELECT ${ENTRY_COLS} FROM files WHERE file_name LIKE ? LIMIT 5`, [pattern]);
 
 	if (matches.length === 0) {
 		await sendMessage(env.BOT_TOKEN, chatId, `❌ No files matching <b>${escapeHtml(fileName)}</b>`);
@@ -1282,20 +1335,7 @@ async function handleTag(env, chatId, args) {
 		return;
 	}
 
-	let text = '🔍 Which file do you want to tag?\n\n';
-	const buttons = [];
-	for (const m of matches) {
-		text += `📄 ${escapeHtml(m.file_name)}\n`;
-		buttons.push([
-			{
-				text: `🏷 ${truncateForCallback(m.file_name, 25)}`,
-				callback_data: `tag:${m.id}:${newTags.join(',')}`,
-			},
-		]);
-	}
-	await sendMessage(env.BOT_TOKEN, chatId, text, {
-		reply_markup: { inline_keyboard: buttons },
-	});
+	await sendFilePicker(env, chatId, '🏷 Which file do you want to tag?', matches, (m) => `tag:${m.id}:${newTags.join(',')}`);
 }
 
 async function applyTags(env, chatId, file, newTags) {
@@ -1339,7 +1379,7 @@ async function handleRename(env, chatId, args) {
 
 	// Otherwise the whole argument names the file (spaces allowed)
 	const exact = await dbFirst(env.DB, 'SELECT id, file_name FROM files WHERE file_name = ? COLLATE NOCASE', [query]);
-	const matches = exact ? [exact] : await dbAll(env.DB, 'SELECT id, file_name FROM files WHERE file_name LIKE ? LIMIT 5', [`%${query}%`]);
+	const matches = exact ? [exact] : await dbAll(env.DB, `SELECT ${ENTRY_COLS} FROM files WHERE file_name LIKE ? LIMIT 5`, [`%${query}%`]);
 
 	if (matches.length === 0) {
 		await sendMessage(env.BOT_TOKEN, chatId, `❌ No files matching <b>${escapeHtml(query)}</b>`);
@@ -1350,12 +1390,7 @@ async function handleRename(env, chatId, args) {
 		return;
 	}
 
-	let text = '🔍 Which file?\n\n';
-	const buttons = matches.map((m, i) => {
-		text += `<b>${i + 1}.</b> ${escapeHtml(m.file_name)}\n`;
-		return { text: String(i + 1), callback_data: `ren:${m.id}` };
-	});
-	await sendMessage(env.BOT_TOKEN, chatId, text, { reply_markup: { inline_keyboard: [buttons] } });
+	await sendFilePicker(env, chatId, '✏️ Which file do you want to rename?', matches, (m) => `ren:${m.id}`);
 }
 
 async function sendRenamePrompt(env, chatId, file) {
@@ -1412,7 +1447,7 @@ async function handleSetCategory(env, chatId, args) {
 	const exact = await dbFirst(env.DB, 'SELECT id, file_name, category FROM files WHERE file_name = ?', [keyword]);
 	const matches = exact
 		? [exact]
-		: await dbAll(env.DB, 'SELECT id, file_name, category FROM files WHERE file_name LIKE ? LIMIT 5', [`%${keyword}%`]);
+		: await dbAll(env.DB, `SELECT ${ENTRY_COLS} FROM files WHERE file_name LIKE ? LIMIT 5`, [`%${keyword}%`]);
 
 	if (matches.length === 0) {
 		await sendMessage(env.BOT_TOKEN, chatId, `❌ No files matching <b>${escapeHtml(keyword)}</b>`);
@@ -1424,13 +1459,7 @@ async function handleSetCategory(env, chatId, args) {
 		return;
 	}
 
-	let text = '🔍 Which file?\n\n';
-	const buttons = [];
-	for (const m of matches) {
-		text += `📄 ${escapeHtml(m.file_name)} · ${categoryLabel(m.category)}\n`;
-		buttons.push([{ text: `🗂 ${truncateForCallback(m.file_name, 30)}`, callback_data: `catmenu:${m.id}` }]);
-	}
-	await sendMessage(env.BOT_TOKEN, chatId, text, { reply_markup: { inline_keyboard: buttons } });
+	await sendFilePicker(env, chatId, '🗂 Which file do you want to recategorize?', matches, (m) => `catmenu:${m.id}`);
 }
 
 async function sendCategoryMenu(env, chatId, editMsgId, file) {
@@ -1459,13 +1488,17 @@ async function handleClassify(env, chatId, editMsgId = null) {
 		return;
 	}
 
-	let text = `🗂 Processed ${results.length} file${results.length !== 1 ? 's' : ''}:\n\n`;
-	for (const r of results) {
-		text += `${categoryLabel(r.category)} · ${escapeHtml(r.name)}`;
-		if (r.oldName !== r.name) text += `\n      <i>was ${escapeHtml(r.oldName)}</i>`;
-		text += '\n';
-	}
-	text += remaining > 0 ? `\n${remaining} left.` : '\n✅ All done.';
+	const entries = results.map((r, i) =>
+		formatFileEntry({ file_name: r.name, mime_type: r.mimeType, category: r.category }, i + 1, {
+			note: r.oldName !== r.name ? `was ${escapeHtml(r.oldName)}` : '',
+		}),
+	);
+	const text = formatFileList(
+		`🗂 Processed ${results.length} file${results.length !== 1 ? 's' : ''}`,
+		remaining > 0 ? `${remaining} left` : 'All done',
+		entries,
+		remaining > 0 ? '<i>Tap Continue for the next batch.</i>' : '✅ Every file has a category and a real name.',
+	);
 
 	const extra = remaining > 0 ? { reply_markup: { inline_keyboard: [[{ text: '▶️ Continue', callback_data: 'classify_more' }]] } } : {};
 	if (editMsgId) await editMessage(env.BOT_TOKEN, chatId, editMsgId, text, extra);
@@ -1515,7 +1548,7 @@ async function classifyPendingBatch(env) {
 		const wanted = autoFileName(f.file_name, f.mime_type ?? '', { category, name: suggestions[i].name }, date);
 		const name = wanted === f.file_name ? wanted : await resolveUniqueFileName(env.DB, wanted);
 		await dbRun(env.DB, 'UPDATE files SET category = ?, file_name = ? WHERE id = ?', [category, name, f.id]);
-		results.push({ id: f.id, oldName: f.file_name, name, category });
+		results.push({ id: f.id, oldName: f.file_name, name, category, mimeType: f.mime_type ?? '' });
 	}
 
 	return { results, remaining: needsWork.length - batch.length };
