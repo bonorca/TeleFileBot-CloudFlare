@@ -8,6 +8,7 @@
 		"deploy": "wrangler deploy",
 		"db:init": "wrangler d1 execute telefilebot-cloudflare-db --file=schema.sql --remote",
 		"db:migrate": "wrangler d1 execute telefilebot-cloudflare-db --file=migrations/0001_add_category.sql --remote",
+		"db:migrate:2": "wrangler d1 execute telefilebot-cloudflare-db --file=migrations/0002_media_groups.sql --remote",
 		"webhook:register": "echo 'Visit https://YOUR_WORKER.workers.dev/registerWebhook'",
 		"webhook:unregister": "echo 'Visit https://YOUR_WORKER.workers.dev/unregisterWebhook'",
 		"logs": "wrangler tail"

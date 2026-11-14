@@ -20,6 +20,9 @@ const PREVIEW_MAX_BYTES = 1024 * 1024;
 // How many unclassified files /classify processes per run.
 const CLASSIFY_BATCH_SIZE = 8;
 
+// Quiet period after the last album item before the album summary is sent.
+const ALBUM_SETTLE_MS = 2500;
+
 // /get falls back to AI search over at most this many recent files.
 const AI_SEARCH_MAX_FILES = 1500;
 
@@ -563,15 +566,13 @@ function categoryKeyboard(fileId) {
 /**
  * Buttons under a saved/renamed/recategorized file.
  */
-function fileActionsKeyboard(fileId) {
-	return {
-		inline_keyboard: [
-			[
-				{ text: '✏️ Rename', callback_data: `ren:${fileId}` },
-				{ text: '🗂 Category', callback_data: `catmenu:${fileId}` },
-			],
-		],
-	};
+function fileActionsKeyboard(fileId, { withGet = false } = {}) {
+	const row = [
+		{ text: '✏️ Rename', callback_data: `ren:${fileId}` },
+		{ text: '🗂 Category', callback_data: `catmenu:${fileId}` },
+	];
+	if (withGet) row.unshift({ text: '⬇️ Get', callback_data: `get:${fileId}` });
+	return { inline_keyboard: [row] };
 }
 
 // =============================================================================
@@ -598,7 +599,7 @@ async function handleHelp(env, chatId) {
 	const text = `📦 <b>TeleFileBot</b>
 Send any file to save it. It is categorized automatically, and files with
 meaningless names (photo_123.jpg, IMG_4521.HEIC) are renamed after their
-content. A caption helps with both.
+content. A caption helps with both; on an album it applies to every file.
 
 <b>BROWSE</b>
 /list [&lt;category&gt;]
@@ -641,9 +642,14 @@ content. A caption helps with both.
 
 // ---- File Upload ----
 
-async function handleFileUpload(env, chatId, message) {
+async function handleFileUpload(env, chatId, message, ctx) {
 	const info = extractFileInfo(message);
 	if (!info) return;
+
+	// Album items are reported together in one summary (see scheduleAlbumSummary)
+	const groupId = message.media_group_id ?? '';
+	let caption = message.caption ?? '';
+	if (groupId) caption = await rememberAlbumCaption(env, groupId, caption);
 
 	let { fileId, fileUniqueId, fileSize, mimeType, fileName } = info;
 	fileName = sanitizeFileName(fileName);
@@ -651,6 +657,11 @@ async function handleFileUpload(env, chatId, message) {
 	// Check for duplicate by unique file ID (exact same file on Telegram servers)
 	const duplicate = await dbFirst(env.DB, 'SELECT id, file_name FROM files WHERE file_unique_id = ?', [fileUniqueId]);
 	if (duplicate) {
+		if (groupId) {
+			await dbRun(env.DB, 'UPDATE media_groups SET dup_count = dup_count + 1 WHERE group_id = ?', [groupId]);
+			await scheduleAlbumSummary(env, chatId, groupId, ctx);
+			return;
+		}
 		await sendMessage(env.BOT_TOKEN, chatId, `⚠️ This file already exists as <b>${escapeHtml(duplicate.file_name)}</b>`);
 		return;
 	}
@@ -677,7 +688,7 @@ async function handleFileUpload(env, chatId, message) {
 		fileName,
 		mimeType,
 		fileSize,
-		caption: message.caption ?? '',
+		caption,
 		source: origin?.chat?.title ?? origin?.sender_chat?.title ?? '',
 		preview: info.preview,
 	});
@@ -692,10 +703,15 @@ async function handleFileUpload(env, chatId, message) {
 	// Persist to database
 	const inserted = await dbRun(
 		env.DB,
-		`INSERT INTO files (file_name, file_id, file_unique_id, file_size, mime_type, message_id, tags, category)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		[fileName, fileId, fileUniqueId, fileSize, mimeType, channelMsgId, '', category],
+		`INSERT INTO files (file_name, file_id, file_unique_id, file_size, mime_type, message_id, tags, category, media_group_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		[fileName, fileId, fileUniqueId, fileSize, mimeType, channelMsgId, '', category, groupId],
 	);
+
+	if (groupId) {
+		await scheduleAlbumSummary(env, chatId, groupId, ctx);
+		return;
+	}
 
 	await sendMessage(
 		env.BOT_TOKEN,
@@ -730,6 +746,118 @@ async function resolveUniqueFileName(db, fileName) {
 	} while (await dbFirst(db, 'SELECT id FROM files WHERE file_name = ?', [candidate]));
 
 	return candidate;
+}
+
+// ---- Albums (media groups) ----
+//
+// Telegram delivers each item of an album as a separate update, often in
+// parallel, with no "last item" marker. Every item bumps media_groups.seq
+// when it is done; after ALBUM_SETTLE_MS, only the item whose seq is still
+// the latest reports. A late straggler reports again, editing the summary.
+
+/**
+ * Record an album's caption (only the first item usually carries one) and
+ * return the caption known for the album so far.
+ */
+async function rememberAlbumCaption(env, groupId, caption) {
+	const row = await dbFirst(
+		env.DB,
+		`INSERT INTO media_groups (group_id, caption) VALUES (?, ?)
+     ON CONFLICT(group_id) DO UPDATE SET caption = CASE WHEN excluded.caption != '' THEN excluded.caption ELSE media_groups.caption END
+     RETURNING caption`,
+		[groupId, caption],
+	);
+	return row?.caption ?? caption;
+}
+
+/**
+ * Mark one album item as processed and arrange for the summary to be sent
+ * once the album has gone quiet. Runs after the webhook response when
+ * `ctx.waitUntil` is available, so Telegram can deliver the next item.
+ */
+async function scheduleAlbumSummary(env, chatId, groupId, ctx) {
+	const row = await dbFirst(env.DB, 'UPDATE media_groups SET seq = seq + 1 WHERE group_id = ? RETURNING seq', [groupId]);
+	const settleMs = Number(env.ALBUM_SETTLE_MS) || ALBUM_SETTLE_MS;
+
+	const task = (async () => {
+		await new Promise((resolve) => setTimeout(resolve, settleMs));
+		const now = await dbFirst(env.DB, 'SELECT seq FROM media_groups WHERE group_id = ?', [groupId]);
+		if (now?.seq !== row?.seq) return; // a later item will report
+		await sendAlbumSummary(env, chatId, groupId);
+	})().catch((err) => console.error('Album summary failed:', err));
+
+	if (ctx?.waitUntil) ctx.waitUntil(task);
+	else await task;
+}
+
+async function sendAlbumSummary(env, chatId, groupId) {
+	const files = await dbAll(env.DB, 'SELECT id, file_name, file_size, category FROM files WHERE media_group_id = ? ORDER BY id', [groupId]);
+	const group = await dbFirst(env.DB, 'SELECT caption, dup_count FROM media_groups WHERE group_id = ?', [groupId]);
+	const dups = group?.dup_count ?? 0;
+
+	let text;
+	if (files.length === 0) {
+		text = `⚠️ All ${dups} file${dups !== 1 ? 's' : ''} in this album were already saved.`;
+	} else {
+		const counts = {};
+		for (const f of files) counts[f.category] = (counts[f.category] ?? 0) + 1;
+		const breakdown = Object.entries(counts)
+			.sort((a, b) => b[1] - a[1])
+			.map(([cat, n]) => `${categoryLabel(cat)} ×${n}`)
+			.join(' · ');
+
+		text = `📦 Saved ${files.length} file${files.length !== 1 ? 's' : ''} from an album\n🗂 ${breakdown}`;
+		if (group?.caption) text += `\n💬 <i>${escapeHtml(group.caption)}</i>`;
+		if (dups) text += `\n⚠️ ${dups} already saved, skipped`;
+		text += '\n\n';
+		files.forEach((f, i) => {
+			text += `<b>${i + 1}.</b> ${escapeHtml(f.file_name)} · ${categoryLabel(f.category)}\n`;
+		});
+		text += '\n<i>Tap a number to rename, recategorize or get a file.</i>';
+	}
+
+	const buttons = files.map((f, i) => ({ text: String(i + 1), callback_data: `file:${f.id}` }));
+	const keyboard = [];
+	for (let i = 0; i < buttons.length; i += 5) keyboard.push(buttons.slice(i, i + 5));
+	const extra = { reply_markup: { inline_keyboard: keyboard } };
+
+	// Claim the right to send; whoever loses edits the message instead
+	const claim = await dbRun(env.DB, 'UPDATE media_groups SET summary_msg_id = -1 WHERE group_id = ? AND summary_msg_id IS NULL', [
+		groupId,
+	]);
+	if (claim.meta?.changes === 1) {
+		const sent = await sendMessage(env.BOT_TOKEN, chatId, text, extra);
+		await dbRun(env.DB, 'UPDATE media_groups SET summary_msg_id = ? WHERE group_id = ?', [sent.result.message_id, groupId]);
+		return;
+	}
+
+	// Someone else sent (or is sending) the summary: wait for its id, then edit
+	for (let attempt = 0; attempt < 20; attempt++) {
+		const row = await dbFirst(env.DB, 'SELECT summary_msg_id FROM media_groups WHERE group_id = ?', [groupId]);
+		if (row?.summary_msg_id > 0) {
+			try {
+				await editMessage(env.BOT_TOKEN, chatId, row.summary_msg_id, text, extra);
+			} catch (err) {
+				if (!String(err).includes('message is not modified')) throw err;
+			}
+			return;
+		}
+		await new Promise((resolve) => setTimeout(resolve, 250));
+	}
+}
+
+/**
+ * Detail card for one file, opened from an album summary.
+ */
+async function sendFileCard(env, chatId, fileId) {
+	const f = await dbFirst(env.DB, 'SELECT id, file_name, file_size, mime_type, category, tags FROM files WHERE id = ?', [fileId]);
+	if (!f) return false;
+	const meta = [categoryLabel(f.category), formatFileSize(f.file_size)];
+	if (f.tags) meta.push(`🏷 ${f.tags}`);
+	await sendMessage(env.BOT_TOKEN, chatId, `${fileIcon(f.mime_type)} <b>${escapeHtml(f.file_name)}</b>\n<i>${escapeHtml(meta.join(' · '))}</i>`, {
+		reply_markup: fileActionsKeyboard(f.id, { withGet: true }),
+	});
+	return true;
 }
 
 // ---- /list & /all ----
@@ -1542,6 +1670,13 @@ async function handleCallback(env, callback) {
 			return;
 		}
 
+		// File detail card (from an album summary)
+		if (data.startsWith('file:')) {
+			const found = await sendFileCard(env, chatId, parseInt(data.split(':')[1], 10));
+			await answerCallback(env.BOT_TOKEN, callback.id, found ? '' : 'File not found');
+			return;
+		}
+
 		// Ask for a new name
 		if (data.startsWith('ren:')) {
 			const fileId = parseInt(data.split(':')[1], 10);
@@ -1626,7 +1761,7 @@ async function handleCallback(env, callback) {
 //  Message Router
 // =============================================================================
 
-async function handleMessage(env, message) {
+async function handleMessage(env, message, ctx) {
 	const chatId = message.chat?.id;
 	if (!chatId) return;
 
@@ -1647,7 +1782,7 @@ async function handleMessage(env, message) {
 		message.animation ||
 		message.sticker
 	) {
-		await handleFileUpload(env, chatId, message);
+		await handleFileUpload(env, chatId, message, ctx);
 		return;
 	}
 
@@ -1718,7 +1853,7 @@ async function handleMessage(env, message) {
 // =============================================================================
 
 export default {
-	async fetch(request, env) {
+	async fetch(request, env, ctx) {
 		const url = new URL(request.url);
 
 		// --- Health check ---
@@ -1761,7 +1896,7 @@ export default {
 
 			try {
 				if (update.message) {
-					await handleMessage(env, update.message);
+					await handleMessage(env, update.message, ctx);
 				} else if (update.callback_query) {
 					await handleCallback(env, update.callback_query);
 				}
