@@ -9,7 +9,8 @@ CREATE TABLE IF NOT EXISTS files (
   mime_type      TEXT    DEFAULT '',
   message_id     INTEGER NOT NULL,
   uploaded_at    TEXT    DEFAULT (datetime('now')),
-  tags           TEXT    DEFAULT ''
+  tags           TEXT    DEFAULT '',
+  category       TEXT    DEFAULT ''
 );
 
 -- Indexes for common query patterns
@@ -18,3 +19,4 @@ CREATE INDEX IF NOT EXISTS idx_file_unique_id ON files(file_unique_id);
 CREATE INDEX IF NOT EXISTS idx_tags           ON files(tags);
 CREATE INDEX IF NOT EXISTS idx_uploaded_at    ON files(uploaded_at);
 CREATE INDEX IF NOT EXISTS idx_mime_type      ON files(mime_type);
+CREATE INDEX IF NOT EXISTS idx_category       ON files(category);

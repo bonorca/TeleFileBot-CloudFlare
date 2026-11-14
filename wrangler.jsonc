@@ -7,6 +7,10 @@
 		"enabled": true,
 	},
 	"compatibility_flags": ["nodejs_compat"],
+	// Workers AI, used to auto-classify uploaded files
+	"ai": {
+		"binding": "AI",
+	},
 	"d1_databases": [
 		{
 			"binding": "DB",
