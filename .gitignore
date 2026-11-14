@@ -165,3 +165,6 @@ dist
 .env*
 !.env.example
 .wrangler/
+
+# Personal deploy config (real worker name / database ID)
+wrangler.local.jsonc
