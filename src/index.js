@@ -16,7 +16,7 @@ const AI_MODEL = '@cf/google/gemma-4-26b-a4b-it';
 
 // Images larger than this are not sent to the model (keeps CPU time and
 // token usage low). Photos and thumbnails are normally far below it.
-const PREVIEW_MAX_BYTES = 1024 * 1024;
+const PREVIEW_MAX_BYTES = 512 * 1024;
 
 // How many unclassified files /classify processes per run.
 const CLASSIFY_BATCH_SIZE = 8;
@@ -26,6 +26,16 @@ const ALBUM_SETTLE_MS = 2500;
 
 // /get falls back to AI search over at most this many recent files.
 const AI_SEARCH_MAX_FILES = 1500;
+
+// A Workers AI call that takes longer than this is abandoned (fallbacks apply).
+const AI_TIMEOUT_MS = 25_000;
+
+// Longest file name shown in lists (the full name is kept); keeps a page of
+// ten entries well under Telegram's 4096-character message limit.
+const MAX_DISPLAY_NAME = 120;
+
+// Longest tag; keeps tag filters inside Telegram's 64-byte button data.
+const MAX_TAG_CHARS = 16;
 
 // ---- Categories ----
 //
@@ -123,6 +133,14 @@ const STRINGS = {
 		noMatch: (k) => `❌ No files matching <b>${k}</b>`,
 		tapNumber: 'Tap a number',
 		tapToGet: 'Tap a number to get that file.',
+		textHint: 'Send me a file to save it, or /help to see what I can do.',
+		unknownCommand: (c) => `Unknown command /${c}. Send /help to see all commands.`,
+		tagInvalid: '❌ Tags can contain letters, digits, _ and - only.',
+		tagPickTooLong: '❌ Too many tags to choose a file with buttons. Use the exact file name, in "quotes" if it has spaces.',
+		langNeedsMigration: '❌ Language can\'t be saved: the settings table is missing. Run <code>npm run db:migrate:3</code>, or set BOT_LANG in wrangler.jsonc.',
+		notConfigured: '❌ The bot isn\'t fully configured.',
+		needsMigration: '❌ The database is missing a migration. Run the <code>npm run db:migrate…</code> scripts listed in the README, then try again.',
+		classifyBusy: '⏳ Already working on a batch — wait a moment and try again.',
 
 		// upload
 		alreadyExists: (name) => `⚠️ This file already exists as <b>${name}</b>`,
@@ -229,7 +247,7 @@ content. A caption helps with both; on an album it applies to every file.
 
 <b>BROWSE</b>
 /list [&lt;category&gt;]
-      List categories, or the files in &lt;category&gt;. A tag also works.
+      List categories, or the files in &lt;category&gt;. Use #tag for a tag.
 /all
       List all files, newest first.
 /get &lt;name&gt;
@@ -278,6 +296,14 @@ content. A caption helps with both; on an album it applies to every file.
 		noMatch: (k) => `❌ 没有匹配 <b>${k}</b> 的文件`,
 		tapNumber: '点编号选择',
 		tapToGet: '点编号获取文件。',
+		textHint: '发给我任意文件即可保存，发送 /help 查看所有功能。',
+		unknownCommand: (c) => `没有 /${c} 这个命令。发送 /help 查看所有命令。`,
+		tagInvalid: '❌ 标签只能包含文字、数字、_ 和 -。',
+		tagPickTooLong: '❌ 标签太多，没法用按钮选文件。请写完整文件名，有空格时用"引号"括起来。',
+		langNeedsMigration: '❌ 无法保存语言：缺少 settings 表。请运行 <code>npm run db:migrate:3</code>，或在 wrangler.jsonc 里设置 BOT_LANG。',
+		notConfigured: '❌ bot 还没配置完整。',
+		needsMigration: '❌ 数据库缺少迁移。请按 README 运行对应的 <code>npm run db:migrate…</code> 脚本后再试。',
+		classifyBusy: '⏳ 正在处理上一批，请稍后再试。',
 
 		alreadyExists: (name) => `⚠️ 这个文件已经存过了：<b>${name}</b>`,
 		forwardFailed: '❌ 无法把文件转存到存储频道。\n请确认 bot 是该频道的管理员。',
@@ -371,7 +397,7 @@ content. A caption helps with both; on an album it applies to every file.
 
 <b>浏览</b>
 /list [&lt;分类&gt;]
-      列出分类，或某个分类里的文件。也可以写标签。
+      列出分类，或某个分类里的文件。标签用 #标签。
 /all
       列出全部文件，最新的在前。
 /get &lt;名称&gt;
@@ -402,9 +428,9 @@ content. A caption helps with both; on an album it applies to every file.
 	},
 };
 
-/** Translated string for the current request's language. */
+/** Translated string for the current request's language (falls back to English, then the key). */
 function t(name, ...args) {
-	const value = STRINGS[currentLang()][name] ?? STRINGS.en[name];
+	const value = STRINGS[currentLang()]?.[name] ?? STRINGS.en[name] ?? name;
 	return typeof value === 'function' ? value(...args) : value;
 }
 
@@ -444,32 +470,117 @@ const APP_EXTS = new Set(['apk', 'apks', 'xapk', 'ipa', 'exe', 'msi', 'dmg', 'pk
  * @param {object} body   - JSON-serialisable payload
  * @returns {Promise<object>}
  */
+class TelegramError extends Error {
+	constructor(method, status, description, retryAfter) {
+		super(`Telegram API ${method} failed (${status}): ${description}`);
+		this.method = method;
+		this.status = status;
+		this.description = description;
+		this.retryAfter = retryAfter;
+	}
+}
+
+// Telegram limits (https://core.telegram.org/bots/api)
+const MAX_MESSAGE_CHARS = 4096;
+const MAX_CALLBACK_ANSWER_CHARS = 200;
+const MAX_CAPTION_CHARS = 1024;
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 async function tg(token, method, body = {}) {
-	const res = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
-		method: 'POST',
-		headers: { 'Content-Type': 'application/json' },
-		body: JSON.stringify(body),
-	});
+	// One retry for rate limits (429, waiting what Telegram asks, up to 10 s)
+	// and for transient server or network errors.
+	for (let attempt = 0; ; attempt++) {
+		let res;
+		try {
+			res = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify(body),
+				signal: AbortSignal.timeout(20_000),
+			});
+		} catch (err) {
+			if (attempt === 0) {
+				await sleep(500);
+				continue;
+			}
+			throw new TelegramError(method, 0, String(err?.message ?? err));
+		}
 
-	if (!res.ok) {
-		const text = await res.text();
-		throw new Error(`Telegram API ${method} HTTP ${res.status}: ${text}`);
-	}
+		let json = null;
+		try {
+			json = await res.json();
+		} catch {
+			// non-JSON body (e.g. a proxy error page)
+		}
+		if (res.ok && json?.ok) return json;
 
-	const json = await res.json();
-	if (!json.ok) {
-		throw new Error(`Telegram API ${method} failed: ${json.description || 'unknown error'}`);
+		const retryAfter = json?.parameters?.retry_after;
+		if (attempt === 0 && (res.status === 429 || res.status >= 500)) {
+			await sleep(res.status === 429 ? Math.min((retryAfter ?? 1) * 1000, 10_000) : 500);
+			continue;
+		}
+		throw new TelegramError(method, res.status, json?.description ?? `HTTP ${res.status}`, retryAfter);
 	}
-	return json;
+}
+
+/**
+ * Plain-text version of an HTML message, used when Telegram rejects the HTML.
+ */
+function htmlToPlain(html) {
+	return html
+		.replace(/<[^>]*>/g, '')
+		.replace(/&lt;/g, '<')
+		.replace(/&gt;/g, '>')
+		.replace(/&quot;/g, '"')
+		.replace(/&amp;/g, '&');
+}
+
+function clampText(text, max) {
+	return text.length <= max ? text : text.slice(0, max - 1) + '…';
+}
+
+const byteLength = (s) => new TextEncoder().encode(s).length;
+
+/**
+ * Drop buttons whose callback_data exceeds Telegram's 64-byte limit (one such
+ * button makes Telegram reject the whole message) and empty rows.
+ */
+function safeKeyboard(rows) {
+	return rows
+		.map((row) =>
+			row.filter((b) => {
+				if (b.callback_data === undefined || byteLength(b.callback_data) <= CALLBACK_DATA_LIMIT) return true;
+				console.error('Dropping button with oversized callback_data:', b.callback_data);
+				return false;
+			}),
+		)
+		.filter((row) => row.length > 0);
+}
+
+/**
+ * Send/edit with HTML, falling back to plain text if the HTML is rejected or
+ * the message is too long, so the user always gets an answer.
+ */
+async function sendHtml(token, method, payload) {
+	payload = { ...payload, text: String(payload.text ?? '') || '…' };
+	if (payload.reply_markup?.inline_keyboard) {
+		payload.reply_markup = { ...payload.reply_markup, inline_keyboard: safeKeyboard(payload.reply_markup.inline_keyboard) };
+	}
+	const tooLong = payload.text.length > MAX_MESSAGE_CHARS;
+	if (!tooLong) {
+		try {
+			return await tg(token, method, { ...payload, parse_mode: 'HTML' });
+		} catch (err) {
+			if (!/can't parse entities|message is too long/i.test(err.description ?? '')) throw err;
+			console.error(`${method}: HTML rejected, resending as plain text:`, err.description);
+		}
+	}
+	return tg(token, method, { ...payload, text: clampText(htmlToPlain(payload.text), MAX_MESSAGE_CHARS) });
 }
 
 async function sendMessage(token, chatId, text, extra = {}) {
-	return tg(token, 'sendMessage', {
-		chat_id: chatId,
-		text,
-		parse_mode: 'HTML',
-		...extra,
-	});
+	return sendHtml(token, 'sendMessage', { chat_id: chatId, text, ...extra });
 }
 
 async function forwardMessage(token, chatId, fromChatId, messageId) {
@@ -488,21 +599,33 @@ async function copyMessage(token, chatId, fromChatId, messageId) {
 	});
 }
 
+/**
+ * Answer a button press. Never throws: an expired query (the user waited, or
+ * the work took long) must not turn a finished action into an error.
+ */
 async function answerCallback(token, callbackId, text = '') {
-	return tg(token, 'answerCallbackQuery', {
-		callback_query_id: callbackId,
-		text,
-	});
+	try {
+		return await tg(token, 'answerCallbackQuery', {
+			callback_query_id: callbackId,
+			text: clampText(String(text ?? ''), MAX_CALLBACK_ANSWER_CHARS),
+		});
+	} catch (err) {
+		console.error('answerCallbackQuery failed:', err.description ?? err);
+		return null;
+	}
 }
 
+/**
+ * Edit a message. "Not modified" (same text and buttons, e.g. a button
+ * tapped twice) is not an error.
+ */
 async function editMessage(token, chatId, messageId, text, extra = {}) {
-	return tg(token, 'editMessageText', {
-		chat_id: chatId,
-		message_id: messageId,
-		text,
-		parse_mode: 'HTML',
-		...extra,
-	});
+	try {
+		return await sendHtml(token, 'editMessageText', { chat_id: chatId, message_id: messageId, text, ...extra });
+	} catch (err) {
+		if (/message is not modified/i.test(err.description ?? '')) return null;
+		throw err;
+	}
 }
 
 // =============================================================================
@@ -588,6 +711,19 @@ function sanitizeFileName(name) {
 function extractFileInfo(message) {
 	const ts = Date.now();
 
+	// Before documents: Telegram sets message.document on animations as well
+	if (message.animation) {
+		return {
+			kind: 'animation',
+			fileId: message.animation.file_id,
+			fileUniqueId: message.animation.file_unique_id,
+			fileSize: message.animation.file_size ?? 0,
+			mimeType: message.animation.mime_type ?? 'video/mp4',
+			fileName: message.animation.file_name ?? `animation_${ts}.mp4`,
+			preview: null,
+		};
+	}
+
 	if (message.document) {
 		const doc = message.document;
 		const mimeType = doc.mime_type ?? '';
@@ -634,18 +770,6 @@ function extractFileInfo(message) {
 		};
 	}
 
-	if (message.animation) {
-		return {
-			kind: 'animation',
-			fileId: message.animation.file_id,
-			fileUniqueId: message.animation.file_unique_id,
-			fileSize: message.animation.file_size ?? 0,
-			mimeType: message.animation.mime_type ?? 'video/mp4',
-			fileName: message.animation.file_name ?? `animation_${ts}.mp4`,
-			preview: null,
-		};
-	}
-
 	if (message.audio) {
 		return {
 			kind: 'audio',
@@ -682,14 +806,21 @@ function extractFileInfo(message) {
 		};
 	}
 
-	if (message.sticker && !message.sticker.is_animated) {
+	if (message.sticker) {
+		// Static stickers are WebP, animated ones Lottie (.tgs), video ones WebM
+		const st = message.sticker;
+		const [mimeType, ext] = st.is_animated
+			? ['application/x-tgsticker', 'tgs']
+			: st.is_video
+				? ['video/webm', 'webm']
+				: ['image/webp', 'webp'];
 		return {
 			kind: 'sticker',
-			fileId: message.sticker.file_id,
-			fileUniqueId: message.sticker.file_unique_id,
-			fileSize: message.sticker.file_size ?? 0,
-			mimeType: 'image/webp',
-			fileName: `sticker_${ts}.webp`,
+			fileId: st.file_id,
+			fileUniqueId: st.file_unique_id,
+			fileSize: st.file_size ?? 0,
+			mimeType,
+			fileName: `sticker_${ts}.${ext}`,
 			preview: null,
 		};
 	}
@@ -795,7 +926,7 @@ async function fetchImageDataUrl(env, fileId, mime) {
 	const { result } = await tg(env.BOT_TOKEN, 'getFile', { file_id: fileId });
 	if (!result?.file_path || (result.file_size ?? 0) > PREVIEW_MAX_BYTES) return null;
 
-	const res = await fetch(`https://api.telegram.org/file/bot${env.BOT_TOKEN}/${result.file_path}`);
+	const res = await fetch(`https://api.telegram.org/file/bot${env.BOT_TOKEN}/${result.file_path}`, { signal: AbortSignal.timeout(15_000) });
 	if (!res.ok) return null;
 	const buf = await res.arrayBuffer();
 	if (buf.byteLength > PREVIEW_MAX_BYTES) return null;
@@ -831,11 +962,25 @@ function parseClassification(content) {
 	return { category, name: typeof obj.name === 'string' ? obj.name : null };
 }
 
+/** env.AI.run with a timeout, so a hung model call can't stall a request. */
+async function aiRun(env, input) {
+	const ms = Number(env.AI_TIMEOUT_MS) || AI_TIMEOUT_MS;
+	let timer;
+	const timeout = new Promise((_, reject) => {
+		timer = setTimeout(() => reject(new Error(`Workers AI timed out after ${ms} ms`)), ms);
+	});
+	try {
+		return await Promise.race([env.AI.run(AI_MODEL, input), timeout]);
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
 async function askModel(env, userText, imageUrl) {
 	const content = [{ type: 'text', text: userText }];
 	if (imageUrl) content.push({ type: 'image_url', image_url: { url: imageUrl, detail: 'low' } });
 
-	const res = await env.AI.run(AI_MODEL, {
+	const res = await aiRun(env, {
 		messages: [
 			{ role: 'system', content: classifyPrompt() },
 			{ role: 'user', content },
@@ -941,6 +1086,23 @@ const MIME_EXTENSIONS = {
 	'application/zip': '.zip',
 };
 
+const KNOWN_EXTS = new Set([
+	...BOOK_EXTS, ...APP_EXTS,
+	'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'odt', 'ods', 'odp', 'rtf', 'txt', 'md', 'csv', 'tsv', 'json', 'xml', 'yaml', 'yml', 'toml', 'ini', 'log',
+	'zip', 'rar', '7z', 'tar', 'gz', 'tgz', 'bz2', 'xz',
+	'jpg', 'jpeg', 'png', 'gif', 'webp', 'heic', 'heif', 'bmp', 'tif', 'tiff', 'svg', 'psd', 'raw',
+	'mp4', 'mov', 'mkv', 'avi', 'webm', 'm4v', 'mp3', 'm4a', 'aac', 'flac', 'wav', 'ogg', 'opus', 'tgs', 'srt', 'ass',
+	'html', 'htm', 'css', 'js', 'ts', 'py', 'java', 'c', 'h', 'cpp', 'cs', 'go', 'rs', 'rb', 'php', 'sh', 'bat', 'ps1', 'sql', 'ipynb',
+	'ttf', 'otf', 'woff', 'woff2', 'iso', 'img', 'bin', 'torrent', 'key', 'pem', 'crt', 'ics', 'vcf', 'eml',
+]);
+
+/** True if `name` ends with a known extension, or with the file's current one. */
+function hasKnownExtension(name, currentExt = '') {
+	const m = name.match(/\.([a-z0-9]{1,5})$/i);
+	if (!m) return false;
+	return KNOWN_EXTS.has(m[1].toLowerCase()) || `.${m[1]}`.toLowerCase() === currentExt.toLowerCase();
+}
+
 function fileExtension(fileName, mimeType = '') {
 	const m = fileName.match(/\.[a-z0-9]{1,5}$/i);
 	return m ? m[0] : (MIME_EXTENSIONS[mimeType] ?? '');
@@ -983,7 +1145,8 @@ function categoryKeyboard(fileId) {
 			})),
 		);
 	}
-	rows.push([{ text: t('cancel'), callback_data: 'cancel' }]);
+	// Cancel goes back to the file (not "Cancelled."), keeping its buttons
+	rows.push([{ text: t('cancel'), callback_data: `card:${fileId}` }]);
 	return { inline_keyboard: rows };
 }
 
@@ -1028,7 +1191,7 @@ async function handleFileUpload(env, chatId, message, ctx) {
 	if (groupId) caption = await rememberAlbumCaption(env, groupId, caption);
 
 	let { fileId, fileUniqueId, fileSize, mimeType, fileName } = info;
-	fileName = sanitizeFileName(fileName);
+	fileName = sanitizeFileName(fileName) || `file_${Date.now()}${fileExtension(info.fileName ?? '', mimeType)}`;
 
 	// Check for duplicate by unique file ID (exact same file on Telegram servers)
 	const duplicate = await dbFirst(env.DB, 'SELECT id, file_name FROM files WHERE file_unique_id = ?', [fileUniqueId]);
@@ -1073,12 +1236,29 @@ async function handleFileUpload(env, chatId, message, ctx) {
 	fileName = await resolveUniqueFileName(env.DB, autoNamed);
 
 	// Persist to database
-	const inserted = await dbRun(
-		env.DB,
-		`INSERT INTO files (file_name, file_id, file_unique_id, file_size, mime_type, message_id, tags, category, media_group_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		[fileName, fileId, fileUniqueId, fileSize, mimeType, channelMsgId, '', category, groupId],
-	);
+	let inserted;
+	try {
+		inserted = await dbRun(
+			env.DB,
+			`INSERT INTO files (file_name, file_id, file_unique_id, file_size, mime_type, message_id, tags, category, media_group_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			[fileName, fileId, fileUniqueId, fileSize, mimeType, channelMsgId, '', category, groupId],
+		);
+	} catch (err) {
+		if (!/UNIQUE constraint failed/i.test(String(err?.message ?? err))) throw err;
+		// The same file arrived twice at once (e.g. a webhook retry) and the other copy won:
+		// drop our channel copy and report it like any duplicate.
+		await tg(env.BOT_TOKEN, 'deleteMessage', { chat_id: env.CHANNEL_ID, message_id: channelMsgId }).catch(() => {});
+		if (groupId) {
+			await dbRun(env.DB, 'UPDATE media_groups SET dup_count = dup_count + 1 WHERE group_id = ?', [groupId]);
+			await scheduleAlbumSummary(env, chatId, groupId, ctx);
+			return;
+		}
+		const winner = await dbFirst(env.DB, 'SELECT file_name FROM files WHERE file_unique_id = ?', [fileUniqueId]);
+		await sendMessage(env.BOT_TOKEN, chatId, t('alreadyExists', escapeHtml(winner?.file_name ?? fileName)));
+		return;
+	}
+	fileName = await ensureUniqueName(env, inserted.meta.last_row_id, fileName);
 
 	if (groupId) {
 		await scheduleAlbumSummary(env, chatId, groupId, ctx);
@@ -1091,6 +1271,22 @@ async function handleFileUpload(env, chatId, message, ctx) {
 		`${t('savedAs', escapeHtml(fileName), renamed)}\n🗂 ${categoryLabel(category)} · 💾 ${formatFileSize(fileSize)}`,
 		{ reply_markup: fileActionsKeyboard(inserted.meta.last_row_id) },
 	);
+}
+
+/**
+ * After inserting row `id` as `name`: if an older row already has that name
+ * (two uploads picked the same "unique" name at the same time, as album
+ * items often do), move this row to the next free suffix. The older row
+ * keeps the name, so concurrent uploads settle on distinct names.
+ */
+async function ensureUniqueName(env, id, name) {
+	for (let attempt = 0; attempt < 20; attempt++) {
+		const older = await dbFirst(env.DB, 'SELECT id FROM files WHERE file_name = ? AND id < ? LIMIT 1', [name, id]);
+		if (!older) return name;
+		name = await resolveUniqueFileName(env.DB, name);
+		await dbRun(env.DB, 'UPDATE files SET file_name = ? WHERE id = ?', [name, id]);
+	}
+	return name;
 }
 
 /**
@@ -1131,6 +1327,8 @@ async function resolveUniqueFileName(db, fileName) {
  * return the caption known for the album so far.
  */
 async function rememberAlbumCaption(env, groupId, caption) {
+	// Album rows are only needed for a few seconds; drop week-old ones as we go
+	await dbRun(env.DB, "DELETE FROM media_groups WHERE created_at < datetime('now', '-7 days')", []);
 	const row = await dbFirst(
 		env.DB,
 		`INSERT INTO media_groups (group_id, caption) VALUES (?, ?)
@@ -1161,7 +1359,7 @@ async function scheduleAlbumSummary(env, chatId, groupId, ctx) {
 	else await task;
 }
 
-async function sendAlbumSummary(env, chatId, groupId) {
+async function sendAlbumSummary(env, chatId, groupId, retried = false) {
 	const files = await dbAll(env.DB, 'SELECT id, file_name, file_size, mime_type, category FROM files WHERE media_group_id = ? ORDER BY id', [groupId]);
 	const group = await dbFirst(env.DB, 'SELECT caption, dup_count FROM media_groups WHERE group_id = ?', [groupId]);
 	const dups = group?.dup_count ?? 0;
@@ -1195,7 +1393,14 @@ async function sendAlbumSummary(env, chatId, groupId) {
 		groupId,
 	]);
 	if (claim.meta?.changes === 1) {
-		const sent = await sendMessage(env.BOT_TOKEN, chatId, text, extra);
+		let sent;
+		try {
+			sent = await sendMessage(env.BOT_TOKEN, chatId, text, extra);
+		} catch (err) {
+			// Release the claim so a later item (or retry) can send it
+			await dbRun(env.DB, 'UPDATE media_groups SET summary_msg_id = NULL WHERE group_id = ? AND summary_msg_id = -1', [groupId]);
+			throw err;
+		}
 		await dbRun(env.DB, 'UPDATE media_groups SET summary_msg_id = ? WHERE group_id = ?', [sent.result.message_id, groupId]);
 		return;
 	}
@@ -1213,19 +1418,24 @@ async function sendAlbumSummary(env, chatId, groupId) {
 		}
 		await new Promise((resolve) => setTimeout(resolve, 250));
 	}
+
+	// The sender never finished (it crashed or was cancelled): take over once
+	const takeover = await dbRun(env.DB, 'UPDATE media_groups SET summary_msg_id = NULL WHERE group_id = ? AND summary_msg_id = -1', [groupId]);
+	if (takeover.meta?.changes === 1 && !retried) await sendAlbumSummary(env, chatId, groupId, true);
 }
 
 /**
  * Detail card for one file, opened from an album summary.
  */
-async function sendFileCard(env, chatId, fileId) {
+async function sendFileCard(env, chatId, fileId, editMsgId = null) {
 	const f = await dbFirst(env.DB, 'SELECT id, file_name, file_size, mime_type, category, tags FROM files WHERE id = ?', [fileId]);
 	if (!f) return false;
 	const meta = [categoryLabel(f.category), formatFileSize(f.file_size)];
-	if (f.tags) meta.push(`🏷 ${f.tags}`);
-	await sendMessage(env.BOT_TOKEN, chatId, `${fileIcon(f.mime_type)} <b>${escapeHtml(f.file_name)}</b>\n<i>${escapeHtml(meta.join(' · '))}</i>`, {
-		reply_markup: fileActionsKeyboard(f.id, { withGet: true }),
-	});
+	if (f.tags) meta.push(`🏷 ${clampText(f.tags, 200)}`);
+	const text = `${fileIcon(f.mime_type)} <b>${escapeHtml(f.file_name)}</b>\n<i>${escapeHtml(meta.join(' · '))}</i>`;
+	const extra = { reply_markup: fileActionsKeyboard(f.id, { withGet: true }) };
+	if (editMsgId) await editMessage(env.BOT_TOKEN, chatId, editMsgId, text, extra);
+	else await sendMessage(env.BOT_TOKEN, chatId, text, extra);
 	return true;
 }
 
@@ -1238,8 +1448,9 @@ async function sendFileCard(env, chatId, fileId) {
 async function handleList(env, chatId, args) {
 	const filter = args.trim();
 	if (filter) {
-		// Category names work in either language; anything else is a tag
-		await sendFileList(env, chatId, null, resolveCategoryInput(filter) ?? filter, 0);
+		// Category names work in either language; "#name" or anything else is a tag
+		const asTag = filter.startsWith('#') ? filter.slice(1).trim() : null;
+		await sendFileList(env, chatId, null, asTag ?? resolveCategoryInput(filter) ?? filter, 0);
 	} else {
 		await sendCategoryOverview(env, chatId, null);
 	}
@@ -1320,16 +1531,20 @@ function shortDate(uploadedAt) {
  * Missing fields are simply left out.
  */
 function formatFileEntry(f, idx, { showCategory = true, note = '' } = {}) {
-	const meta = [];
-	if (showCategory && f.category !== undefined) meta.push(categoryLabel(f.category));
-	if (f.file_size) meta.push(formatFileSize(f.file_size));
-	if (f.uploaded_at) meta.push(shortDate(f.uploaded_at));
-	if (f.tags) meta.push(`🏷 ${f.tags}`);
+	// Returns a renderer: formatFileList calls it with smaller name budgets
+	// until the whole message fits Telegram's limit.
+	return (maxName = MAX_DISPLAY_NAME) => {
+		const meta = [];
+		if (showCategory && f.category !== undefined) meta.push(categoryLabel(f.category));
+		if (f.file_size) meta.push(formatFileSize(f.file_size));
+		if (f.uploaded_at) meta.push(shortDate(f.uploaded_at));
+		if (f.tags) meta.push(`🏷 ${clampText(f.tags, Math.ceil(maxName / 2))}`);
 
-	let entry = `<b>${idx}.</b> ${fileIcon(f.mime_type)} ${escapeHtml(f.file_name)}`;
-	if (meta.length) entry += `\n<i>${escapeHtml(meta.join(' · '))}</i>`;
-	if (note) entry += `\n<i>${note}</i>`;
-	return entry;
+		let entry = `<b>${idx}.</b> ${fileIcon(f.mime_type)} ${escapeHtml(clampText(f.file_name ?? '', maxName))}`;
+		if (meta.length) entry += `\n<i>${escapeHtml(meta.join(' · '))}</i>`;
+		if (note) entry += `\n<i>${clampText(note, maxName * 6)}</i>`;
+		return entry;
+	};
 }
 
 /**
@@ -1337,10 +1552,14 @@ function formatFileEntry(f, idx, { showCategory = true, note = '' } = {}) {
  * `subtitle` and `footer` are HTML.
  */
 function formatFileList(title, subtitle, entries, footer = '') {
-	let text = `<b>${title}</b>`;
-	if (subtitle) text += `\n<i>${subtitle}</i>`;
-	text += `\n${LIST_RULE}\n\n${entries.join('\n\n')}`;
-	if (footer) text += `\n\n${LIST_RULE}\n${footer}`;
+	let text;
+	for (const maxName of [MAX_DISPLAY_NAME, 60, 32, 16]) {
+		text = `<b>${title}</b>`;
+		if (subtitle) text += `\n<i>${subtitle}</i>`;
+		text += `\n${LIST_RULE}\n\n${entries.map((e) => (typeof e === 'function' ? e(maxName) : e)).join('\n\n')}`;
+		if (footer) text += `\n\n${LIST_RULE}\n${footer}`;
+		if (text.length <= MAX_MESSAGE_CHARS) break;
+	}
 	return text;
 }
 
@@ -1367,6 +1586,43 @@ async function sendFilePicker(env, chatId, title, files, callbackFor) {
 // Columns every list entry needs
 const ENTRY_COLS = 'id, file_name, file_size, mime_type, category, tags, uploaded_at';
 
+// Every LIKE on user input escapes % and _ with a backslash, so "a_b" means a_b
+const LIKE_ESCAPE = "ESCAPE '\\'";
+function likeEscape(text) {
+	return text.replace(/[\\%_]/g, (c) => `\\${c}`);
+}
+
+/**
+ * Files named `keyword`: an exact (case-insensitive) match wins; otherwise up
+ * to `limit` files whose name contains it.
+ */
+async function matchFilesByName(env, keyword, limit = 5) {
+	const exact = await dbAll(env.DB, `SELECT ${ENTRY_COLS}, message_id FROM files WHERE file_name = ? COLLATE NOCASE ORDER BY id LIMIT 1`, [keyword]);
+	if (exact.length) return exact;
+	return dbAll(
+		env.DB,
+		`SELECT ${ENTRY_COLS}, message_id FROM files WHERE file_name LIKE ? ${LIKE_ESCAPE} ORDER BY uploaded_at DESC, id DESC LIMIT ?`,
+		[`%${likeEscape(keyword)}%`, limit],
+	);
+}
+
+/**
+ * Split command arguments on spaces; "double quotes" (straight or curly)
+ * keep a name with spaces together.
+ */
+function splitArgs(text) {
+	const out = [];
+	const re = /"([^"]*)"|“([^”]*)”|(\S+)/g;
+	let m;
+	while ((m = re.exec(text))) out.push(m[1] ?? m[2] ?? m[3]);
+	return out.filter((a) => a !== '');
+}
+
+/** A tag: letters of any script, digits, _ and -, at most MAX_TAG_CHARS. */
+function cleanTag(raw) {
+	return raw.replace(/^#/, '').replace(/[^\p{L}\p{N}_-]/gu, '').slice(0, MAX_TAG_CHARS);
+}
+
 /**
  * One page of files for a filter.
  * `filter` is a category key, UNCATEGORIZED, a free-form tag, or '' for all files.
@@ -1382,9 +1638,16 @@ async function queryFilePage(env, filter, page) {
 		where = 'WHERE category = ?';
 		params = [filter];
 	} else if (filter) {
-		where = 'WHERE tags LIKE ?';
-		params = [`%${filter}%`];
+		// Whole-tag match: "doc" must not match "docs"
+		where = `WHERE (',' || tags || ',') LIKE ? ${LIKE_ESCAPE}`;
+		params = [`%,${likeEscape(filter)},%`];
 	}
+
+	const countRow = await dbFirst(env.DB, `SELECT COUNT(*) AS cnt FROM files ${where}`, params);
+	const total = countRow?.cnt ?? 0;
+	const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+	// Out-of-range pages (files deleted since the list was sent, or bad input) land on the nearest real page
+	page = Number.isFinite(page) ? Math.min(Math.max(0, Math.trunc(page)), totalPages - 1) : 0;
 
 	const files = await dbAll(
 		env.DB,
@@ -1392,12 +1655,11 @@ async function queryFilePage(env, filter, page) {
      ${where} ORDER BY uploaded_at DESC, id DESC LIMIT ? OFFSET ?`,
 		[...params, PAGE_SIZE, page * PAGE_SIZE],
 	);
-	const countRow = await dbFirst(env.DB, `SELECT COUNT(*) AS cnt FROM files ${where}`, params);
-	return { files, total: countRow?.cnt ?? 0, isCategory };
+	return { files, total, totalPages, page, isCategory };
 }
 
-async function sendFileList(env, chatId, editMsgId, filter, page) {
-	const { files, total, isCategory } = await queryFilePage(env, filter, page);
+async function sendFileList(env, chatId, editMsgId, filter, requestedPage) {
+	const { files, total, totalPages, page, isCategory } = await queryFilePage(env, filter, requestedPage);
 	const back = [{ text: t('btnCategories'), callback_data: 'cats' }];
 
 	if (total === 0) {
@@ -1411,8 +1673,6 @@ async function sendFileList(env, chatId, editMsgId, filter, page) {
 		else await sendMessage(env.BOT_TOKEN, chatId, msg, extra);
 		return;
 	}
-
-	const totalPages = Math.ceil(total / PAGE_SIZE);
 
 	const title = isCategory
 		? escapeHtml(categoryLabel(filter === UNCATEGORIZED ? '' : filter))
@@ -1445,8 +1705,8 @@ async function sendFileList(env, chatId, editMsgId, filter, page) {
  * Send the images on one list page as a Telegram album, captioned with
  * their list numbers so they can be matched to the list.
  */
-async function sendPagePreview(env, chatId, filter, page) {
-	const { files } = await queryFilePage(env, filter, page);
+async function sendPagePreview(env, chatId, filter, requestedPage) {
+	const { files, page } = await queryFilePage(env, filter, requestedPage);
 	const images = files
 		.map((f, i) => ({ ...f, idx: page * PAGE_SIZE + i + 1 }))
 		.filter(isPreviewable)
@@ -1454,7 +1714,7 @@ async function sendPagePreview(env, chatId, filter, page) {
 	if (images.length === 0) return 0;
 
 	const build = (type) =>
-		images.map((f) => ({ type, media: f.file_id, caption: `${f.idx}. ${f.file_name}`.slice(0, 1024) }));
+		images.map((f) => ({ type, media: f.file_id, caption: clampText(`${f.idx}. ${f.file_name}`, MAX_CAPTION_CHARS) }));
 
 	if (images.length === 1) {
 		try {
@@ -1475,7 +1735,7 @@ async function sendPagePreview(env, chatId, filter, page) {
 			// Mixed photo/document pages can't form one album; send them one by one
 			console.error('Album preview failed, sending individually:', err);
 			for (const f of images) {
-				const caption = `${f.idx}. ${f.file_name}`.slice(0, 1024);
+				const caption = clampText(`${f.idx}. ${f.file_name}`, MAX_CAPTION_CHARS);
 				try {
 					await tg(env.BOT_TOKEN, 'sendPhoto', { chat_id: chatId, photo: f.file_id, caption });
 				} catch {
@@ -1503,17 +1763,17 @@ async function findFiles(env, keyword) {
 	const exact = await dbAll(env.DB, `SELECT ${cols} FROM files WHERE file_name = ? COLLATE NOCASE LIMIT 1`, [keyword]);
 	if (exact.length) return { files: exact, via: 'name' };
 
-	const contains = await dbAll(env.DB, `SELECT ${cols} FROM files WHERE file_name LIKE ? ORDER BY uploaded_at DESC LIMIT ?`, [
-		`%${keyword}%`,
+	const contains = await dbAll(env.DB, `SELECT ${cols} FROM files WHERE file_name LIKE ? ${LIKE_ESCAPE} ORDER BY uploaded_at DESC, id DESC LIMIT ?`, [
+		`%${likeEscape(keyword)}%`,
 		MAX_FUZZY_RESULTS,
 	]);
 	if (contains.length) return { files: contains, via: 'name' };
 
 	const words = keyword.split(/[\s_\-.]+/).filter(Boolean);
 	if (words.length > 1) {
-		const where = words.map(() => 'file_name LIKE ?').join(' AND ');
+		const where = words.map(() => `file_name LIKE ? ${LIKE_ESCAPE}`).join(' AND ');
 		const allWords = await dbAll(env.DB, `SELECT ${cols} FROM files WHERE ${where} ORDER BY uploaded_at DESC LIMIT ?`, [
-			...words.map((w) => `%${w}%`),
+			...words.map((w) => `%${likeEscape(w)}%`),
 			MAX_FUZZY_RESULTS,
 		]);
 		if (allWords.length) return { files: allWords, via: 'name' };
@@ -1549,7 +1809,7 @@ async function aiSearchFileIds(env, query) {
 	const list = rows.map((r) => [r.id, r.file_name, bothNames(r.category), r.tags].filter(Boolean).join(' | ')).join('\n');
 
 	try {
-		const res = await env.AI.run(AI_MODEL, {
+		const res = await aiRun(env, {
 			messages: [
 				{ role: 'system', content: SEARCH_PROMPT },
 				{ role: 'user', content: `要找：${query}\n\n文件列表（id | 文件名 | 分类 | 标签）：\n${list}` },
@@ -1641,17 +1901,7 @@ async function handleDelete(env, chatId, args) {
 		return;
 	}
 
-	// Try exact match first
-	const file = await dbFirst(env.DB, 'SELECT id, file_name FROM files WHERE file_name = ?', [keyword]);
-
-	if (file) {
-		await sendDeleteConfirmation(env, chatId, file);
-		return;
-	}
-
-	// Fuzzy match
-	const pattern = `%${keyword}%`;
-	const matches = await dbAll(env.DB, `SELECT ${ENTRY_COLS} FROM files WHERE file_name LIKE ? LIMIT 5`, [pattern]);
+	const matches = await matchFilesByName(env, splitArgs(keyword).join(' ') || keyword);
 
 	if (matches.length === 0) {
 		await sendMessage(env.BOT_TOKEN, chatId, t('noMatch', escapeHtml(keyword)));
@@ -1682,26 +1932,20 @@ async function sendDeleteConfirmation(env, chatId, file) {
 // ---- /tag ----
 
 async function handleTag(env, chatId, args) {
-	const parts = args.trim().split(/\s+/);
+	const parts = splitArgs(args);
 	if (parts.length < 2) {
 		await sendMessage(env.BOT_TOKEN, chatId, t('tagUsage'));
 		return;
 	}
 
 	const fileName = parts[0];
-	const newTags = parts.slice(1).map((t) => t.replace(/[^a-zA-Z0-9_\-]/g, ''));
-
-	// Exact match
-	const file = await dbFirst(env.DB, 'SELECT id, file_name, tags FROM files WHERE file_name = ?', [fileName]);
-
-	if (file) {
-		await applyTags(env, chatId, file, newTags);
+	const newTags = [...new Set(parts.slice(1).map(cleanTag).filter(Boolean))];
+	if (newTags.length === 0) {
+		await sendMessage(env.BOT_TOKEN, chatId, t('tagInvalid'));
 		return;
 	}
 
-	// Fuzzy match
-	const pattern = `%${fileName}%`;
-	const matches = await dbAll(env.DB, `SELECT ${ENTRY_COLS} FROM files WHERE file_name LIKE ? LIMIT 5`, [pattern]);
+	const matches = await matchFilesByName(env, fileName);
 
 	if (matches.length === 0) {
 		await sendMessage(env.BOT_TOKEN, chatId, t('noMatch', escapeHtml(fileName)));
@@ -1713,19 +1957,24 @@ async function handleTag(env, chatId, args) {
 		return;
 	}
 
+	// The tags ride along in the button data, which is capped at 64 bytes
+	if (matches.some((m) => byteLength(`tag:${m.id}:${newTags.join(',')}`) > CALLBACK_DATA_LIMIT)) {
+		await sendMessage(env.BOT_TOKEN, chatId, t('tagPickTooLong'));
+		return;
+	}
 	await sendFilePicker(env, chatId, t('pickTag'), matches, (m) => `tag:${m.id}:${newTags.join(',')}`);
 }
 
 async function applyTags(env, chatId, file, newTags) {
 	const existingTags = file.tags ? file.tags.split(',').filter(Boolean) : [];
-	const merged = [...new Set([...existingTags, ...newTags])].filter(Boolean);
+	const merged = [...new Set([...existingTags, ...newTags.map(cleanTag)])].filter(Boolean);
 	const tagStr = merged.join(',');
 
 	await dbRun(env.DB, 'UPDATE files SET tags = ? WHERE id = ?', [tagStr, file.id]);
 	await sendMessage(
 		env.BOT_TOKEN,
 		chatId,
-		t('tagsUpdated', escapeHtml(file.file_name), merged.map((tag) => `#${tag}`).join(' ')),
+		t('tagsUpdated', escapeHtml(file.file_name), escapeHtml(merged.map((tag) => `#${tag}`).join(' '))),
 	);
 }
 
@@ -1746,9 +1995,9 @@ async function handleRename(env, chatId, args) {
 		return;
 	}
 
-	const parts = query.split(/\s+/);
+	const parts = splitArgs(query);
 	if (parts.length === 2) {
-		const file = await dbFirst(env.DB, 'SELECT id FROM files WHERE file_name = ?', [parts[0]]);
+		const file = await dbFirst(env.DB, 'SELECT id FROM files WHERE file_name = ? COLLATE NOCASE ORDER BY id LIMIT 1', [parts[0]]);
 		if (file) {
 			await applyRename(env, chatId, file.id, parts[1]);
 			return;
@@ -1756,8 +2005,7 @@ async function handleRename(env, chatId, args) {
 	}
 
 	// Otherwise the whole argument names the file (spaces allowed)
-	const exact = await dbFirst(env.DB, 'SELECT id, file_name FROM files WHERE file_name = ? COLLATE NOCASE', [query]);
-	const matches = exact ? [exact] : await dbAll(env.DB, `SELECT ${ENTRY_COLS} FROM files WHERE file_name LIKE ? LIMIT 5`, [`%${query}%`]);
+	const matches = await matchFilesByName(env, parts.length === 1 ? parts[0] : query);
 
 	if (matches.length === 0) {
 		await sendMessage(env.BOT_TOKEN, chatId, t('noMatch', escapeHtml(query)));
@@ -1776,7 +2024,7 @@ async function sendRenamePrompt(env, chatId, file) {
 		env.BOT_TOKEN,
 		chatId,
 		`${t('renamePrompt')} <b>${escapeHtml(file.file_name)}</b>\n<i>${t('renameKeepExt')}</i>\n#${file.id}`,
-		{ reply_markup: { force_reply: true, input_field_placeholder: file.file_name.slice(0, 64) } },
+		{ reply_markup: { force_reply: true, input_field_placeholder: clampText(file.file_name, 64) } },
 	);
 }
 
@@ -1795,7 +2043,10 @@ async function applyRename(env, chatId, fileId, rawName) {
 		await sendMessage(env.BOT_TOKEN, chatId, t('nameEmpty'));
 		return;
 	}
-	if (!/\.[a-z0-9]{1,5}$/i.test(newName)) newName += fileExtension(file.file_name, file.mime_type ?? '');
+	// Keep the old extension unless the new name ends with a real one
+	// ("Invoice No.12345" or "Meeting 3.5" are not extensions)
+	const oldExt = fileExtension(file.file_name, file.mime_type ?? '');
+	if (!hasKnownExtension(newName, oldExt)) newName = newName.slice(0, MAX_FILENAME_LEN - oldExt.length) + oldExt;
 	if (newName === file.file_name) {
 		await sendMessage(env.BOT_TOKEN, chatId, t('nameUnchanged', escapeHtml(newName)));
 		return;
@@ -1822,10 +2073,7 @@ async function handleSetCategory(env, chatId, args) {
 		return;
 	}
 
-	const exact = await dbFirst(env.DB, 'SELECT id, file_name, category FROM files WHERE file_name = ?', [keyword]);
-	const matches = exact
-		? [exact]
-		: await dbAll(env.DB, `SELECT ${ENTRY_COLS} FROM files WHERE file_name LIKE ? LIMIT 5`, [`%${keyword}%`]);
+	const matches = await matchFilesByName(env, splitArgs(keyword).join(' ') || keyword);
 
 	if (matches.length === 0) {
 		await sendMessage(env.BOT_TOKEN, chatId, t('noMatch', escapeHtml(keyword)));
@@ -1857,7 +2105,18 @@ async function sendCategoryMenu(env, chatId, editMsgId, file) {
  * files without one, and a real name to files with a generic one.
  */
 async function handleClassify(env, chatId, editMsgId = null) {
-	const { results, remaining } = await classifyPendingBatch(env);
+	// Tapping Continue twice must not process (and pay for) the same batch twice
+	if (!(await acquireLock(env, 'classify', 120_000))) {
+		await sendMessage(env.BOT_TOKEN, chatId, t('classifyBusy'));
+		return;
+	}
+	let batch;
+	try {
+		batch = await classifyPendingBatch(env);
+	} finally {
+		await releaseLock(env, 'classify');
+	}
+	const { results, remaining } = batch;
 
 	if (results.length === 0) {
 		const msg = t('classifyAllGood');
@@ -1932,6 +2191,36 @@ async function classifyPendingBatch(env) {
 	return { results, remaining: needsWork.length - batch.length };
 }
 
+// ---- Locks ----
+
+/**
+ * Best-effort lock stored in the settings table, expiring after `ttlMs` so a
+ * crashed holder can't block forever. Without the table (migration 0003 not
+ * applied) locking is skipped rather than failing the command.
+ */
+async function acquireLock(env, name, ttlMs) {
+	const now = Date.now();
+	try {
+		const r = await dbRun(
+			env.DB,
+			`INSERT INTO settings (key, value) VALUES (?, ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value WHERE CAST(settings.value AS INTEGER) < ?`,
+			[`lock:${name}`, String(now), now - ttlMs],
+		);
+		return r.meta?.changes === 1;
+	} catch {
+		return true;
+	}
+}
+
+async function releaseLock(env, name) {
+	try {
+		await dbRun(env.DB, 'DELETE FROM settings WHERE key = ?', [`lock:${name}`]);
+	} catch {
+		// settings table missing — nothing was locked
+	}
+}
+
 // ---- /lang ----
 
 /**
@@ -1945,7 +2234,13 @@ async function handleLang(env, chatId, args, editMsgId = null) {
 	const wanted = validLang(aliases[input] ?? input);
 
 	if (wanted) {
-		await dbRun(env.DB, "INSERT INTO settings (key, value) VALUES ('lang', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", [wanted]);
+		try {
+			await dbRun(env.DB, "INSERT INTO settings (key, value) VALUES ('lang', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", [wanted]);
+		} catch (err) {
+			if (!/no such table/i.test(String(err?.message ?? err))) throw err;
+			await sendMessage(env.BOT_TOKEN, chatId, t('langNeedsMigration'));
+			return;
+		}
 		await langStore.run(wanted, async () => {
 			const text = t('langSet', LANGUAGES[wanted]);
 			if (editMsgId) await editMessage(env.BOT_TOKEN, chatId, editMsgId, text);
@@ -1984,7 +2279,7 @@ async function handleStats(env, chatId) {
          ELSE 'Other'
        END AS category,
        COUNT(*) AS cnt
-     FROM files GROUP BY category ORDER BY cnt DESC`,
+     FROM files GROUP BY 1 ORDER BY cnt DESC`,
 		[],
 	);
 
@@ -2039,8 +2334,14 @@ async function handleCallback(env, callback) {
 			const fileId = parseInt(data.split(':')[1], 10);
 			const file = await dbFirst(env.DB, 'SELECT file_name, message_id FROM files WHERE id = ?', [fileId]);
 			if (file) {
-				await copyMessage(env.BOT_TOKEN, chatId, env.CHANNEL_ID, file.message_id);
-				await answerCallback(env.BOT_TOKEN, callback.id, file.file_name);
+				try {
+					await copyMessage(env.BOT_TOKEN, chatId, env.CHANNEL_ID, file.message_id);
+					await answerCallback(env.BOT_TOKEN, callback.id, file.file_name);
+				} catch (err) {
+					console.error('copyMessage failed:', err);
+					await answerCallback(env.BOT_TOKEN, callback.id);
+					await sendMessage(env.BOT_TOKEN, chatId, t('retrieveFailed'));
+				}
 			} else {
 				await answerCallback(env.BOT_TOKEN, callback.id, t('fileNotFound'));
 			}
@@ -2109,8 +2410,17 @@ async function handleCallback(env, callback) {
 			const file = await dbFirst(env.DB, 'SELECT id, file_name, tags FROM files WHERE id = ?', [fileId]);
 			if (file) {
 				await applyTags(env, chatId, file, newTags);
+				await answerCallback(env.BOT_TOKEN, callback.id, t('tagsUpdatedToast'));
+			} else {
+				await answerCallback(env.BOT_TOKEN, callback.id, t('fileNotFound'));
 			}
-			await answerCallback(env.BOT_TOKEN, callback.id, t('tagsUpdatedToast'));
+			return;
+		}
+
+		// Back to the file card (Cancel in the category menu)
+		if (data.startsWith('card:')) {
+			const found = await sendFileCard(env, chatId, parseInt(data.split(':')[1], 10), msgId);
+			await answerCallback(env.BOT_TOKEN, callback.id, found ? '' : t('fileNotFound'));
 			return;
 		}
 
@@ -2253,7 +2563,10 @@ async function handleMessage(env, message, ctx) {
 
 	// Parse command (handles @BotUsername suffix in groups)
 	const match = text.match(/^\/(\w+)(@\w+)?(.*)/s);
-	if (!match) return;
+	if (!match) {
+		await sendMessage(env.BOT_TOKEN, chatId, t('textHint'));
+		return;
+	}
 
 	const cmd = match[1].toLowerCase();
 	const args = (match[3] ?? '').trim();
@@ -2297,7 +2610,7 @@ async function handleMessage(env, message, ctx) {
 			await handleLang(env, chatId, args);
 			break;
 		default:
-			// Unknown command — silently ignore
+			await sendMessage(env.BOT_TOKEN, chatId, t('unknownCommand', escapeHtml(cmd)));
 			break;
 	}
 }
@@ -2305,6 +2618,23 @@ async function handleMessage(env, message, ctx) {
 // =============================================================================
 //  Worker Entrypoint
 // =============================================================================
+
+function safeDecode(s) {
+	try {
+		return decodeURIComponent(s);
+	} catch {
+		return s;
+	}
+}
+
+/** Constant-time string comparison for secrets. */
+function timingSafeEqual(a, b) {
+	const x = new TextEncoder().encode(String(a));
+	const y = new TextEncoder().encode(String(b));
+	let diff = x.length ^ y.length;
+	for (let i = 0; i < Math.max(x.length, y.length); i++) diff |= (x[i] ?? 0) ^ (y[i] ?? 0);
+	return diff === 0;
+}
 
 export default {
 	async fetch(request, env, ctx) {
@@ -2315,28 +2645,54 @@ export default {
 			return Response.json({ status: 'ok', bot: 'TeleFileBot' });
 		}
 
+		// Everything below needs the secrets. Without BOT_SECRET the webhook
+		// path would be "/webhook/undefined", which anyone could guess.
+		const missing = ['BOT_TOKEN', 'BOT_SECRET', 'CHANNEL_ID', 'ADMIN_ID'].filter((k) => !env[k]);
+		if (missing.length) {
+			console.error('Missing secrets:', missing.join(', '));
+			return new Response(`Not configured: set ${missing.join(', ')} with "wrangler secret put"`, { status: 503 });
+		}
+
+		// The admin URLs change the webhook, so they need the secret too:
+		//   /registerWebhook?secret=<BOT_SECRET>
+		const isAdminUrl = url.pathname === '/registerWebhook' || url.pathname === '/unregisterWebhook';
+		if (isAdminUrl && !timingSafeEqual(url.searchParams.get('secret') ?? '', env.BOT_SECRET)) {
+			return new Response('Forbidden: add ?secret=<BOT_SECRET> to the URL', { status: 403 });
+		}
+
 		// --- Register webhook ---
 		if (url.pathname === '/registerWebhook') {
-			const webhookUrl = `${url.origin}/webhook/${env.BOT_SECRET}`;
-			const result = await tg(env.BOT_TOKEN, 'setWebhook', {
-				url: webhookUrl,
-				allowed_updates: ['message', 'callback_query'],
-				drop_pending_updates: true,
-			});
-			await langStore.run(await resolveLang(env), () => tg(env.BOT_TOKEN, 'setMyCommands', { commands: botCommands() }));
-			return Response.json(result, { status: 200 });
+			// Encode the secret so characters like "#", "?" or spaces survive the URL
+			const webhookUrl = `${url.origin}/webhook/${encodeURIComponent(env.BOT_SECRET)}`;
+			try {
+				const result = await tg(env.BOT_TOKEN, 'setWebhook', {
+					url: webhookUrl,
+					allowed_updates: ['message', 'callback_query'],
+					drop_pending_updates: true,
+				});
+				try {
+					await langStore.run(await resolveLang(env), () => tg(env.BOT_TOKEN, 'setMyCommands', { commands: botCommands() }));
+				} catch (err) {
+					console.error('setMyCommands failed:', err); // the webhook itself is set
+				}
+				return Response.json(result, { status: 200 });
+			} catch (err) {
+				return Response.json({ ok: false, error: err.description ?? String(err) }, { status: 502 });
+			}
 		}
 
 		// --- Unregister webhook ---
 		if (url.pathname === '/unregisterWebhook') {
-			const result = await tg(env.BOT_TOKEN, 'deleteWebhook', {
-				drop_pending_updates: true,
-			});
-			return Response.json(result, { status: 200 });
+			try {
+				const result = await tg(env.BOT_TOKEN, 'deleteWebhook', { drop_pending_updates: true });
+				return Response.json(result, { status: 200 });
+			} catch (err) {
+				return Response.json({ ok: false, error: err.description ?? String(err) }, { status: 502 });
+			}
 		}
 
 		// --- Webhook endpoint ---
-		if (url.pathname === `/webhook/${env.BOT_SECRET}`) {
+		if (url.pathname.startsWith('/webhook/') && timingSafeEqual(safeDecode(url.pathname.slice('/webhook/'.length)), env.BOT_SECRET)) {
 			if (request.method !== 'POST') {
 				return new Response('Method Not Allowed', { status: 405 });
 			}
@@ -2351,10 +2707,20 @@ export default {
 			try {
 				// Everything for this update (including ctx.waitUntil work) runs in its language
 				await langStore.run(await resolveLang(env), async () => {
-					if (update.message) {
-						await handleMessage(env, update.message, ctx);
-					} else if (update.callback_query) {
-						await handleCallback(env, update.callback_query);
+					try {
+						if (update.message) {
+							await handleMessage(env, update.message, ctx);
+						} else if (update.callback_query) {
+							await handleCallback(env, update.callback_query);
+						}
+					} catch (err) {
+						// Tell the admin something went wrong instead of going quiet
+						const chatId = update.message?.chat?.id;
+						if (chatId && String(chatId) === String(env.ADMIN_ID)) {
+							const missingMigration = /no such (table|column)|has no column/i.test(String(err?.message ?? err));
+							await sendMessage(env.BOT_TOKEN, chatId, t(missingMigration ? 'needsMigration' : 'error')).catch(() => {});
+						}
+						throw err;
 					}
 				});
 			} catch (err) {

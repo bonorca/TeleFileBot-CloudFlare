@@ -139,11 +139,13 @@ wrangler deploy
 
 #### 第 6 步：注册 webhook
 
-在浏览器打开：
+在浏览器打开下面的地址，带上你的 `BOT_SECRET`：
 
 ```
-https://your-worker.workers.dev/registerWebhook
+https://your-worker.workers.dev/registerWebhook?secret=YOUR_BOT_SECRET
 ```
+
+不带密钥会返回 403，别人就无法改掉或删除你的 webhook。`/unregisterWebhook?secret=…` 也一样。
 
 </details>
 
@@ -157,7 +159,7 @@ https://your-worker.workers.dev/registerWebhook
 
 | 用法 | 说明 |
 | ---- | ---- |
-| `/list [<分类>]` | 列出分类，或某个分类里的文件。也可以写标签。 |
+| `/list [<分类>]` | 列出分类，或某个分类里的文件。`/list #标签` 按标签列出。 |
 | `/all` | 列出全部文件，最新的在前。 |
 | `/get <名称>` | 获取文件。可以只写一部分；名字匹配不到时由 AI 查找。 |
 
@@ -265,6 +267,14 @@ const AI_SEARCH_MAX_FILES = 1500; // AI 搜索最多看多少个文件
 ```
 
 分类定义在同一个文件的 `CATEGORIES` 列表里。每个分类有：存进数据库的 `key`（有数据之后不要改）、英文提示词里用的 ASCII `id`、显示名 `en` / `zh`，以及给 AI 看的说明。
+
+---
+
+## 开发
+
+```bash
+npm test   # 端到端测试：模拟 Telegram 和 Workers AI，使用真实的 SQLite 数据库（Node 22.5+）
+```
 
 ---
 

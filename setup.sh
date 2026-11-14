@@ -199,7 +199,7 @@ success "Deployed to: $WORKER_URL"
 # =============================================================================
 step "Step 7/7: Registering Telegram webhook..."
 
-WEBHOOK_RESULT=$(curl -s "${WORKER_URL}/registerWebhook")
+WEBHOOK_RESULT=$(curl -s "${WORKER_URL}/registerWebhook?secret=${BOT_SECRET}")
 echo "$WEBHOOK_RESULT"
 
 if echo "$WEBHOOK_RESULT" | grep -q '"ok":true'; then

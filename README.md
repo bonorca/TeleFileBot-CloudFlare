@@ -139,11 +139,13 @@ wrangler deploy
 
 #### Step 6: Register the webhook
 
-Open this URL in your browser:
+Open this URL in your browser, with your `BOT_SECRET`:
 
 ```
-https://your-worker.workers.dev/registerWebhook
+https://your-worker.workers.dev/registerWebhook?secret=YOUR_BOT_SECRET
 ```
+
+Without the secret the URL answers 403, so nobody else can re-point or remove your webhook. `/unregisterWebhook?secret=…` works the same way.
 
 </details>
 
@@ -157,7 +159,7 @@ Notation: `<arg>` required · `[arg]` optional · `...` repeatable
 
 | Synopsis             | Description                                                        |
 | -------------------- | ------------------------------------------------------------------ |
-| `/list [<category>]` | List categories, or the files in `<category>`. A tag also works.   |
+| `/list [<category>]` | List categories, or the files in `<category>`. `/list #tag` lists a tag. |
 | `/all`               | List all files, newest first.                                      |
 | `/get <name>`        | Send a file. Partial names work; AI searches when no name matches. |
 
@@ -265,6 +267,14 @@ const AI_SEARCH_MAX_FILES = 1500; // Files the AI search looks at
 ```
 
 Categories are the `CATEGORIES` list in the same file. Each has a stored `key` (never change it once you have data), an ASCII `id` used in English prompts, display names `en` / `zh`, and descriptions the AI reads.
+
+---
+
+## Development
+
+```bash
+npm test   # end-to-end tests with a fake Telegram, fake Workers AI and a real SQLite DB (Node 22.5+)
+```
 
 ---
 
